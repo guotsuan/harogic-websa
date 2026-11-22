@@ -40,7 +40,7 @@ Python 用于崩溃监护、离线工具和测试。
 
 ## 试用
 
-Windows x64 的构建与启动见[运行指南](docs/zh-CN/WINDOWS.md)。
+### Linux
 
 首次 clone 后，准备 Linux 构建依赖并执行：
 
@@ -67,6 +67,34 @@ CXXABI 1.3.15 和 `libfdk-aac.so.2`；系统不兼容时请源码构建。
 打开 **http://127.0.0.1:8080**。真实硬件需将单独取得的 HAROGIC SDK 安装于 `/opt/htraapi`，
 然后运行 `./run.sh`。仓库不包含专有 SDK。[快速开始](docs/zh-CN/GETTING_STARTED.md)
 说明依赖、独立实例及更新方式。
+
+### Windows x64 与 PX Z 手持式频谱仪
+
+**PXE-90 Z、PXE-200 Z 和 PXN-400Z** 搭载 Windows 11 x64。可以在另一台 Windows x64 开发电脑编译，再把生成的应用目录复制到仪器，也可以在仪器安装构建工具后本机编译。 [HAROGIC PX Z 产品页](https://www.harogic.cn/product/pxe-z-edition/)
+
+当前 WebSA 通过 HTRA 的 **USB 接口**打开设备。在手持机本机运行前，请确认厂商 SDK 能通过 USB 打开分析仪。如果 SDK 只通过以太网暴露分析仪，WebSA 需要适配以太网采集。浏览器通过局域网访问 WebSA 与仪器采集接口是两回事。
+
+安装 Visual Studio 2022 Build Tools，勾选 **使用 C++ 的桌面开发**并安装 Windows SDK。还需要 CMake、Git、Rust 1.95 或更新版本、Node.js 22 和 Python 3。解压 [HAROGIC 频谱分析仪 Windows x64 SDK 0.55.100](https://www.harogic.com/windows-sdk/)。`-SdkDirectory` 指向包含 `htra_api.h`、`htra_api_pnm.h`、`htra_api.lib` 和 `htra_api.dll` 的 `x64\htra_api` 目录。
+
+从仓库根目录打开 PowerShell，按实际解压位置修改 `$sdkDir`。
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+$fdkSource = Join-Path $HOME 'fdk-aac'
+$sdkDir = Join-Path $HOME 'Downloads\SA_Windows_API\x64\htra_api'
+git clone --depth 1 --branch v2.0.3 https://github.com/mstorsjo/fdk-aac.git $fdkSource
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1 -FdkSource $fdkSource -SdkDirectory $sdkDir
+```
+
+构建产物位于 `windows-build\app`，包括 `websad.exe`、网页前端、`htra_api\websa_san90_sdk_session.dll` 和 `Start-WebSA.bat`。首次实机运行用下面的命令把厂商 SDK 运行库和 `CalFile` 复制到本地构建目录并启动 WebSA。校准文件须与仪器 UID 匹配，启动前请退出 SAStudio4。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -SdkDirectory $sdkDir
+```
+
+在仪器上打开 [http://127.0.0.1:8080/](http://127.0.0.1:8080/)，先试标准扫频（STD），再切换到 SDR。以后按 Ctrl+C 停止旧实例后，可双击应用目录里的 `Start-WebSA.bat` 启动。BAT 监听 `0.0.0.0:8080`，供可信局域网访问。只试模拟模式时，构建可省略 `-SdkDirectory`，然后在仓库根目录运行 `.\run-windows.ps1 -Fake`。
+
+Windows 扫频和 SDR 已在一台 N400 R2V2 上跑通。9.4 GHz 和 19.5 GHz 的 SDR 调谐与回读使用模拟 SDK 验证，三款 PX Z 仍待实机验收。更多校准、排障和功能说明见 [Windows 运行指南](docs/zh-CN/WINDOWS.md)。
 
 ## 构建与测试
 

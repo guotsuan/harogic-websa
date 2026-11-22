@@ -2,6 +2,18 @@
 
 Windows 10／11 x64 版使用与 Linux 版相同的浏览器前端。通过模拟模式可以先验证页面、频谱、瀑布图和内置 SDR 解调。硬件模式使用 HAROGIC 0.55.100 版 Windows x64 HTRA SDK。
 
+## PX Z 手持式频谱仪
+
+三款机型使用同一套 Windows x64 构建流程。厂商标称射频上限见下表。 [HAROGIC PX Z 产品页](https://www.harogic.cn/product/pxe-z-edition/)
+
+| 机型 | 厂商标称射频上限 | WebSA 验证状态 |
+| --- | ---: | --- |
+| PXE-90 Z | 9.5 GHz | 9.4 GHz 的 SDR 调谐及回读已用模拟 SDK 验证，待实机验收 |
+| PXE-200 Z | 20 GHz | 19.5 GHz 的 SDR 调谐及回读已用模拟 SDK 验证，待实机验收 |
+| PXN-400Z | 40 GHz | 待确认本机 HTRA 连接方式及实机采集 |
+
+WebSA 的适配器当前使用 HTRA USB 接口。如果厂商 SDK 只通过以太网暴露仪器，需适配以太网采集。确认连接时，请在手持机本机的 Windows 上先用厂商程序或 SDK 示例打开分析仪。退出厂商程序后再启动 WebSA。N400 R2V2 的实机结果来自已测试的那台设备，PXN-400Z 单独验收。
+
 ## 启动
 
 在 Windows 应用目录双击 `Start-WebSA.bat` 启动实机模式。确保 HAROGIC 驱动已安装，SAStudio4 等占用仪器的程序已关闭，应用的 `htra_api` 下有厂商 SDK 运行库和这台仪器对应的 `CalFile`。从源码构建时，可先在仓库根目录运行下面的命令，把 SDK 运行库和校准目录复制到本地构建产物中。
@@ -16,16 +28,13 @@ Windows 10／11 x64 版使用与 Linux 版相同的浏览器前端。通过模�
 
 ## 从源码构建
 
-需要 Visual Studio 2022 Build Tools（桌面 C++ 开发和 Windows SDK）、CMake、Rust 1.95 或更新版本、Node.js 22、Python 3 和 Git。在仓库根目录执行：
+工具链、SDK 路径和编译命令见[项目 README 的 Windows 小节](../../README.zh-CN.md#windows-x64-与-px-z-手持式频谱仪)。生成目录为 `windows-build\app`，可整体复制到另一台 Windows x64 电脑或手持机。复制前确认应用内的 `htra_api` 已准备好厂商运行库和目标仪器对应的校准文件。
+
+省略构建命令中的 `-SdkDirectory` 可仅生成模拟模式所需文件。FDK AAC 使用 [v2.0.3 源码](https://github.com/mstorsjo/fdk-aac/tree/v2.0.3)静态链接。PowerShell 如禁止直接执行本地脚本，可在单次进程内启动。
 
 ```powershell
-rustup target add x86_64-pc-windows-msvc
-git clone --depth 1 --branch v2.0.3 https://github.com/mstorsjo/fdk-aac.git C:\SDK\fdk-aac
-.\build-windows.ps1 -FdkSource C:\SDK\fdk-aac -SdkDirectory C:\SDK\SA_Windows_API\x64\htra_api
-.\run-windows.ps1 -Fake
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -Fake
 ```
-
-省略构建命令中的 `-SdkDirectory` 可仅生成模拟模式所需文件。生成目录为 `windows-build\app`，脚本也可从仓库根目录启动该应用。FDK AAC 使用上面指定的 [v2.0.3 源码](https://github.com/mstorsjo/fdk-aac/tree/v2.0.3)静态链接。PowerShell 如禁止直接执行本地脚本，可用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -Fake` 在单次进程内启动。
 
 ## 实机验证
 

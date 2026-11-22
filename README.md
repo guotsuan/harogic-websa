@@ -46,6 +46,8 @@ The decoder and recording screenshots use synthetic/replayed IQ. Other screensho
 
 ## Try it
 
+### Linux
+
 After cloning, prepare the Linux build prerequisites and run:
 
 ```bash
@@ -72,6 +74,34 @@ GLIBCXX 3.4.30, CXXABI 1.3.15 and `libfdk-aac.so.2`; rebuild if your system cann
 Open **http://127.0.0.1:8080**. For real hardware, install the separately supplied HAROGIC
 SDK under `/opt/htraapi` and run `./run.sh`. The proprietary SDK is not bundled.
 [Getting started](docs/en/GETTING_STARTED.md) covers prerequisites, instances and updates.
+
+### Windows x64 and PX Z handhelds
+
+**PXE-90 Z, PXE-200 Z and PXN-400Z** run Windows 11 x64. Build on a Windows x64 development PC or on the instrument after installing the build tools. You can copy the generated application directory to the instrument. [HAROGIC PX Z product page](https://www.harogic.com/product/pxe-z-edition-handheld-spectrum-analyzer/)
+
+The current WebSA adapter opens instruments through the HTRA **USB** interface. Use the handheld's local Windows session and confirm that the SDK can open its analyzer through USB. An analyzer that the SDK exposes only through Ethernet requires an Ethernet adapter in WebSA. The browser's LAN connection to WebSA is independent of the analyzer connection.
+
+Install Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK, plus CMake, Git, Rust 1.95 or newer, Node.js 22 and Python 3. Extract the [HAROGIC Spectrum Analyzer Windows x64 SDK 0.55.100](https://www.harogic.com/windows-sdk/). `-SdkDirectory` points to the inner `x64\htra_api` directory containing `htra_api.h`, `htra_api_pnm.h`, `htra_api.lib` and `htra_api.dll`.
+
+Run from the repository root in PowerShell. Adjust `$sdkDir` if you extracted the SDK elsewhere.
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+$fdkSource = Join-Path $HOME 'fdk-aac'
+$sdkDir = Join-Path $HOME 'Downloads\SA_Windows_API\x64\htra_api'
+git clone --depth 1 --branch v2.0.3 https://github.com/mstorsjo/fdk-aac.git $fdkSource
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1 -FdkSource $fdkSource -SdkDirectory $sdkDir
+```
+
+The build writes `websad.exe`, the frontend, `htra_api\websa_san90_sdk_session.dll` and `Start-WebSA.bat` to `windows-build\app`. On the first hardware run, the following command copies the separately supplied SDK DLLs and `CalFile` into the local build and starts WebSA. Use the calibration files for the instrument's UID and close SAStudio4 before running it.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -SdkDirectory $sdkDir
+```
+
+Open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) on the instrument. Test swept spectrum (STD) before switching to SDR. For later runs, stop the current instance with Ctrl+C and double-click `Start-WebSA.bat` in the application directory. The BAT listens on `0.0.0.0:8080` for access from a trusted LAN. To build and run with simulated data, omit `-SdkDirectory` from the build and run `.\run-windows.ps1 -Fake` from the checkout.
+
+Windows swept spectrum and SDR were confirmed on an N400 R2V2. The 9.4 GHz and 19.5 GHz SDR tuning and readback tests used a simulated SDK. Hardware validation on the three PX Z models is pending. See the [Windows guide (Chinese)](docs/zh-CN/WINDOWS.md) for calibration, troubleshooting and Windows feature availability.
 
 ## Build and test
 
