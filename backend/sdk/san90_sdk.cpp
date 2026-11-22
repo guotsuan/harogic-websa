@@ -15,7 +15,15 @@
 #include <mutex>
 #include <thread>
 #include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#define WEBSA_SHIM_EXPORT extern "C" __declspec(dllexport)
+#else
+#define WEBSA_SHIM_EXPORT extern "C"
 #include "iqs_usb_pipeline.hpp"
+#endif
+
+#ifndef _WIN32
 
 // The vendor's IQS reader uses synchronous 64 KiB bulk reads. Keep bounded reads
 // in flight at full rate on a bounded USB pump; SDK calls retain their owner.
@@ -34,14 +42,16 @@ extern "C" int LIBUSB_CALL libusb_bulk_transfer(libusb_device_handle* device,
     return websa_iqs_usb::current().read(device, endpoint, data, length, transferred, timeout);
 }
 
+#endif
+
 struct San90Device;
 struct San90RtaDevice;
 struct San90SwpDevice;
 struct San90PnmDevice;
-extern "C" int san90_close(San90Device*);
-extern "C" int san90_rta_close_v1(San90RtaDevice*);
-extern "C" int san90_swp_close_v1(San90SwpDevice*);
-extern "C" int san90_pnm_close_v1(San90PnmDevice*);
+WEBSA_SHIM_EXPORT int san90_close(San90Device*);
+WEBSA_SHIM_EXPORT int san90_rta_close_v1(San90RtaDevice*);
+WEBSA_SHIM_EXPORT int san90_swp_close_v1(San90SwpDevice*);
+WEBSA_SHIM_EXPORT int san90_pnm_close_v1(San90PnmDevice*);
 static int san90_retire(San90Device* state) { return san90_close(state); }
 static int san90_retire(San90RtaDevice* state) { return san90_rta_close_v1(state); }
 static int san90_retire(San90SwpDevice* state) { return san90_swp_close_v1(state); }
@@ -69,7 +79,9 @@ class San90Session {
         for (;;) {
             wake_.wait(lock, [&] { return operation_ || stopping_; });
             if (stopping_) return;
+#ifndef _WIN32
             websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::operation);
+#endif
             auto operation = operation_;
             auto argument = argument_;
             lock.unlock();
@@ -89,7 +101,9 @@ class San90Session {
                 handle = nullptr;
                 healthy = false;
             }
+#ifndef _WIN32
             websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::idle);
+#endif
             lock.lock();
             result_ = result;
             operation_ = nullptr;
@@ -188,12 +202,22 @@ public:
     ~San90Session() { finish(true); }
 };
 
+#ifdef _WIN32
+// DLL initialization runs under the Windows loader lock. Create the SDK
+// owner on its first call, and join it through san90_session_finish_v1.
+static San90Session& san90_session_instance() {
+    static auto* const session = new San90Session();
+    return *session;
+}
+#define san90_session (san90_session_instance())
+#else
 static San90Session san90_session;
+#endif
 #define SAN90_DISPATCH(state, expression) \
     if (!san90_session.on_thread()) \
         return san90_session.call(state, [&] { return expression; })
 
-extern "C" int san90_session_invalidate_v1(void* state, int abandon) {
+WEBSA_SHIM_EXPORT int san90_session_invalidate_v1(void* state, int abandon) {
     SAN90_DISPATCH(state, san90_session_invalidate_v1(state, abandon));
     if (!state || state != san90_session.active) return -110;
     san90_session.invalidate = true;
@@ -204,8 +228,8 @@ extern "C" int san90_session_invalidate_v1(void* state, int abandon) {
     return 0;
 }
 
-extern "C" int san90_session_release_v1() { return san90_session.release_idle(); }
-extern "C" int san90_session_finish_v1() { return san90_session.finish(); }
+WEBSA_SHIM_EXPORT int san90_session_release_v1() { return san90_session.release_idle(); }
+WEBSA_SHIM_EXPORT int san90_session_finish_v1() { return san90_session.finish(); }
 
 // Front-end and clock fields shared by the SWP, RTA and IQS profiles (v11 entry points).
 // Enum values follow htra_api.h; the field mapping follows web_sa/hardware/device.py _profile.
@@ -319,10 +343,40 @@ static uint64_t san90_elapsed_ns(San90Clock::time_point start,
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 }
 
+// Trace SDK startup on demand so a blocked call can be located without
+// changing the acquisition profile or logging every packet.
+static bool san90_iqs_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBSA_IQS_DIAGNOSTICS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+template <typename Call>
+static int san90_trace_iqs_call(const char* name, Call call) {
+    if (!san90_iqs_diagnostics_enabled()) return call();
+    std::fprintf(stderr, "IQS diagnostic: %s started\n", name);
+    std::fflush(stderr);
+    const auto began = San90Clock::now();
+    const int status = call();
+    std::fprintf(stderr, "IQS diagnostic: %s returned %d after %.3f ms\n", name,
+                 status, san90_elapsed_ns(began) / 1e6);
+    std::fflush(stderr);
+    return status;
+}
+
+// Existing firmware and vendor SDK examples use these two CS16 payload lengths.
+static constexpr uint32_t san90_iqs_fft_samples = 16240;
+static bool san90_iqs_packet_size_supported(uint32_t samples) {
+    return samples == san90_iqs_fft_samples || samples == 16242;
+}
+
 struct San90Device {
     void* handle = nullptr;
     void* dsp = nullptr;
     uint32_t fft_points = 0;
+    uint32_t packet_samples = san90_iqs_fft_samples;
     double center_hz = 0;
     double sample_rate_hz = 62500000.0;
     double bandwidth_hz = 0;
@@ -334,6 +388,7 @@ struct San90Device {
     San90IqsTiming timing{};
     San90Clock::time_point last_iqs_entry{};
     bool has_iqs_entry = false;
+    bool trace_first_read = false;
 };
 
 struct San90PacketInfo {
@@ -343,7 +398,7 @@ struct San90PacketInfo {
 };
 
 // Memory-only getters: configuration records the SDK's resolved clock source.
-extern "C" int san90_iqs_clock_v1(San90Device* state, double* refclk_hz, int* refclk_src) {
+WEBSA_SHIM_EXPORT int san90_iqs_clock_v1(San90Device* state, double* refclk_hz, int* refclk_src) {
     SAN90_DISPATCH(state, san90_iqs_clock_v1(state, refclk_hz, refclk_src));
     if (!san90_session.usable()) return -8;
     if (!state || !refclk_hz || !refclk_src) return -100;
@@ -352,7 +407,7 @@ extern "C" int san90_iqs_clock_v1(San90Device* state, double* refclk_hz, int* re
     return 0;
 }
 
-extern "C" int san90_iqs_front_end_actual_v1(San90Device* state, San90FrontEndActual* actual) {
+WEBSA_SHIM_EXPORT int san90_iqs_front_end_actual_v1(San90Device* state, San90FrontEndActual* actual) {
     SAN90_DISPATCH(state, san90_iqs_front_end_actual_v1(state, actual));
     if (!san90_session.usable()) return -8;
     if (!state || !actual || san90_session.active != state) return -100;
@@ -360,7 +415,7 @@ extern "C" int san90_iqs_front_end_actual_v1(San90Device* state, San90FrontEndAc
     return 0;
 }
 
-extern "C" int san90_clock_capabilities_v1(void* state, int* ocxo_type, int* internal_ocxo) {
+WEBSA_SHIM_EXPORT int san90_clock_capabilities_v1(void* state, int* ocxo_type, int* internal_ocxo) {
     SAN90_DISPATCH(state, san90_clock_capabilities_v1(state, ocxo_type, internal_ocxo));
     if (!san90_session.usable()) return -8;
     if (!state || !ocxo_type || !internal_ocxo) return -100;
@@ -373,7 +428,9 @@ extern "C" int san90_clock_capabilities_v1(void* state, int* ocxo_type, int* int
 static int san90_iqs_configure(San90Device* state, double center_hz, const San90FrontEnd& fe,
                                double* usable_bandwidth, double* configured_center,
                                int device_decimate) {
+#ifndef _WIN32
     websa_iqs_usb::current().stop();
+#endif
     if (state->triggered) {
         int status = IQS_BusTriggerStop(&state->handle);
         if (status == -8 || status == -9) return status;
@@ -381,17 +438,28 @@ static int san90_iqs_configure(San90Device* state, double center_hz, const San90
     }
     SWP_Profile_TypeDef reset{}, reset_out{};
     SWP_TraceInfo_TypeDef reset_trace{};
-    int status = SWP_ProfileDeInit(&state->handle, &reset);
+    int status = san90_trace_iqs_call("SWP_ProfileDeInit", [&] { return SWP_ProfileDeInit(&state->handle, &reset); });
     if (status) return status;
-    status = san90_retry_bus(
-        [&] { return SWP_Configuration(&state->handle, &reset, &reset_out, &reset_trace); });
+    status = san90_trace_iqs_call("SWP_Configuration reset", [&] {
+        return san90_retry_bus([&] { return SWP_Configuration(&state->handle, &reset, &reset_out, &reset_trace); });
+    });
     if (status) return status;
     IQS_Profile_TypeDef in{}, configured{};
     IQS_StreamInfo_TypeDef stream{};
-    status = IQS_ProfileDeInit(&state->handle, &in);
+    status = san90_trace_iqs_call("IQS_ProfileDeInit", [&] { return IQS_ProfileDeInit(&state->handle, &in); });
     if (status) return status;
     in.CenterFreq_Hz = center_hz;
-    in.DecimateFactor = device_decimate > 0 ? device_decimate : 1;
+    const auto model = san90_session.boot_info.DeviceInfo.Model;
+    const double default_native_rate = in.NativeIQSampleRate_SPS;
+    const bool native_125_msps = model == Device_N400_R2_V2 ||
+        (model >= Device_E90_R0 && model <= Device_E90_R5) ||
+        (model >= Device_E200_R0 && model <= Device_E200_R3) ||
+        std::fabs(default_native_rate - 125e6) <= 1.0 ||
+        std::fabs(default_native_rate - 122.88e6) <= 1.0;
+    const uint32_t requested_decimate = device_decimate > 0 ? device_decimate : 1;
+    // Keep the existing 62.5 MS/s-derived DSP grid on 125 MS/s instruments.
+    in.DecimateFactor = native_125_msps ? 2 * requested_decimate : requested_decimate;
+    if (native_125_msps) in.NativeIQSampleRate_SPS = 125e6;
     in.DataFormat = Complex16bit;
     in.TriggerSource = Bus;
     in.TriggerMode = Adaptive;
@@ -401,25 +469,46 @@ static int san90_iqs_configure(San90Device* state, double center_hz, const San90
     in.DCCancelerMode = DCCAutoOffsetMode;
     in.QDCMode = QDCOff;
     san90_apply_front_end(in, fe);
-    status = san90_retry_bus(
-        [&] { return IQS_Configuration(&state->handle, &in, &configured, &stream); });
+    status = san90_trace_iqs_call("IQS_Configuration", [&] {
+        return san90_retry_bus([&] { return IQS_Configuration(&state->handle, &in, &configured, &stream); });
+    });
+    if (san90_iqs_diagnostics_enabled()) {
+        std::fprintf(stderr, "IQS diagnostic: requested decimate=%d, hardware decimate=%u, "
+                     "SDK samples=%u bytes=%u rate=%.3f Hz bandwidth=%.3f Hz format=%d center=%.3f Hz\n",
+                     device_decimate, in.DecimateFactor, stream.PacketSamples, stream.PacketDataSize,
+                     stream.IQSampleRate, stream.Bandwidth, static_cast<int>(configured.DataFormat),
+                     configured.CenterFreq_Hz);
+        std::fflush(stderr);
+    }
     if (status) return status;
-    // PacketSamples is fixed at 16240 samples per packet at every decimate
-    // (measured); the sample RATE scales with the device decimate factor.
-    if (stream.PacketSamples != 16240 || stream.PacketDataSize != 16240 * 4 ||
+    if (!san90_iqs_packet_size_supported(stream.PacketSamples) ||
+        stream.PacketDataSize != stream.PacketSamples * 4 ||
         configured.DataFormat != Complex16bit || !std::isfinite(stream.IQSampleRate) ||
         stream.IQSampleRate <= 0.0 ||
-        std::fabs(stream.IQSampleRate * device_decimate - 62500000.0) > 1.0)
+        std::fabs(stream.IQSampleRate * device_decimate - 62500000.0) > 1.0) {
+        std::fprintf(stderr, "SDK IQS geometry rejected: decimate=%d hardware_decimate=%u samples=%u bytes=%u rate=%.6f Hz format=%d\n",
+                     device_decimate, in.DecimateFactor, stream.PacketSamples, stream.PacketDataSize, stream.IQSampleRate,
+                     static_cast<int>(configured.DataFormat));
+        std::fflush(stderr);
         return -102;
+    }
     if (!std::isfinite(stream.Bandwidth) || stream.Bandwidth < 300000.0 ||
         stream.Bandwidth > stream.IQSampleRate)
         return -104;
+    // The SDK enforces the active instrument's RF range. Reject a clamped or
+    // otherwise inconsistent readback before publishing the new capture geometry.
     if (!std::isfinite(configured.CenterFreq_Hz) || configured.CenterFreq_Hz < 8000.0 ||
-        configured.CenterFreq_Hz > 9020000000.0)
+        std::fabs(configured.CenterFreq_Hz - center_hz) > 1000.0) {
+        std::fprintf(stderr, "SDK IQS center rejected: requested=%.3f Hz configured=%.3f Hz\n",
+                     center_hz, configured.CenterFreq_Hz);
+        std::fflush(stderr);
         return -105;
+    }
     state->center_hz = configured.CenterFreq_Hz;
     state->sample_rate_hz = stream.IQSampleRate;
+    state->packet_samples = stream.PacketSamples;
     state->bandwidth_hz = stream.Bandwidth;
+    state->trace_first_read = san90_iqs_diagnostics_enabled();
     state->refclk_hz = configured.ReferenceClockFrequency;
     state->refclk_src = static_cast<int>(configured.ReferenceClockSource);
     state->front_end_actual = san90_front_end_actual(configured);
@@ -430,40 +519,41 @@ static int san90_iqs_configure(San90Device* state, double center_hz, const San90
 
 // v8 prepares the stream without starting acquisition. The consumer must finish
 // its metadata and DSP setup before calling san90_iqs_arm_v1.
-extern "C" int san90_open_v8(San90Device** out, double center_hz, const San90FrontEnd* fe,
+WEBSA_SHIM_EXPORT int san90_open_v8(San90Device** out, double center_hz, const San90FrontEnd* fe,
                                int device_decimate, double* usable_bandwidth,
                                double* configured_center) {
     SAN90_DISPATCH(nullptr, san90_open_v8(out, center_hz, fe, device_decimate, usable_bandwidth, configured_center));
     if (!out || !fe || !usable_bandwidth || !configured_center || !std::isfinite(center_hz) ||
-        center_hz < 9000.0 || center_hz > 9000000000.0 || !std::isfinite(fe->ref_dbm) ||
+        center_hz < 9000.0 || !std::isfinite(fe->ref_dbm) ||
         device_decimate <= 0 || (device_decimate & (device_decimate - 1)) != 0 ||
         device_decimate > 2048)
         return -100;
     *out = nullptr;
     auto* state = new (std::nothrow) San90Device;
     if (!state) return -101;
-    int status = san90_open_device(state);
+    int status = san90_trace_iqs_call("device session", [&] { return san90_open_device(state); });
     if (status) {
         // A failed Device_Open may leave an unusable slot: never Device_Close it.
         delete state;
         return status;
     }
     {
-        status = DSP_Open(&state->dsp);
+        status = san90_trace_iqs_call("DSP_Open", [&] { return DSP_Open(&state->dsp); });
         if (status) goto fail;
         DSP_FFT_TypeDef in{}, configured{};
         double rbw_ratio = 0;
-        status = DSP_FFT_DeInit(&in);
+        status = san90_trace_iqs_call("DSP_FFT_DeInit", [&] { return DSP_FFT_DeInit(&in); });
         if (status) goto fail;
         in.Calibration = false;
         in.DetectionRatio = 1;
         in.TraceDetector = TraceDetector_PosPeak;
-        in.FFTSize = 16240;
-        in.SamplePts = 16240;  // SDK input frame and FFT buffer MUST match.
+        in.FFTSize = san90_iqs_fft_samples;
+        in.SamplePts = san90_iqs_fft_samples;
         in.Intercept = 0.8f;
         in.WindowType = FlatTop;
-        status = DSP_FFT_Configuration(&state->dsp, &in, &configured, &state->fft_points,
-                                       &rbw_ratio);
+        status = san90_trace_iqs_call("DSP_FFT_Configuration", [&] {
+            return DSP_FFT_Configuration(&state->dsp, &in, &configured, &state->fft_points, &rbw_ratio);
+        });
         if (status) goto fail;
         if (state->fft_points < 2 || state->fft_points > 16240) {
             status = -106;
@@ -487,28 +577,30 @@ fail:
     return status;
 }
 
-extern "C" int san90_iqs_arm_v1(San90Device* state) {
+WEBSA_SHIM_EXPORT int san90_iqs_arm_v1(San90Device* state) {
     SAN90_DISPATCH(state, san90_iqs_arm_v1(state));
     if (!san90_session.usable()) return -8;
     if (!state) return -100;
     if (state->triggered) return 0;
-    int status = IQS_BusTriggerStart(&state->handle);
+    int status = san90_trace_iqs_call("IQS_BusTriggerStart", [&] { return IQS_BusTriggerStart(&state->handle); });
     if (status) return status;
     state->triggered = true;
+#ifndef _WIN32
     if (websa_iqs_usb::current().start(state->sample_rate_hz == 62500000.0))
         std::fprintf(stderr, "SDK IQS: %u ordered USB transfers, %u packet handoff at 62.5 MSps\n",
             websa_iqs_usb::Pipeline::transfer_count(), websa_iqs_usb::Pipeline::handoff_capacity());
+#endif
     return 0;
 }
 
 // Retune, re-level or re-rate the live IQS stream without Device_Close/Device_Open.
-extern "C" int san90_iqs_reconfig_v2(San90Device* state, double center_hz,
+WEBSA_SHIM_EXPORT int san90_iqs_reconfig_v2(San90Device* state, double center_hz,
                                        const San90FrontEnd* fe, int device_decimate,
                                        double* usable_bandwidth, double* configured_center) {
     SAN90_DISPATCH(state, san90_iqs_reconfig_v2(state, center_hz, fe, device_decimate, usable_bandwidth, configured_center));
     if (!san90_session.usable()) return -8;
     if (!state || !fe || !usable_bandwidth || !configured_center ||
-        !std::isfinite(center_hz) || center_hz < 9000.0 || center_hz > 9000000000.0 ||
+        !std::isfinite(center_hz) || center_hz < 9000.0 ||
         !std::isfinite(fe->ref_dbm) || device_decimate <= 0 ||
         (device_decimate & (device_decimate - 1)) != 0 || device_decimate > 2048)
         return -100;
@@ -517,31 +609,44 @@ extern "C" int san90_iqs_reconfig_v2(San90Device* state, double center_hz,
     return status ? status : san90_iqs_arm_v1(state);
 }
 
-// All production IQ entry points share the same fixed CS16 packet contract.
-// Check the SDK's byte count and width before copying from its borrowed pointer.
-static bool san90_valid_iqs_packet(const IQStream_TypeDef& stream, uint32_t capacity) {
-    return stream.IQS_StreamInfo.PacketSamples == 16240 && capacity >= 16240 &&
-        stream.IQS_StreamInfo.PacketDataSize == 16240 * 4 &&
+// Check the packet against the configured geometry before copying the SDK buffer.
+static bool san90_valid_iqs_packet(const IQStream_TypeDef& stream, uint32_t configured, uint32_t capacity) {
+    return stream.IQS_StreamInfo.PacketSamples == configured && capacity >= configured &&
+        stream.IQS_StreamInfo.PacketDataSize == configured * 4 &&
         stream.IQS_Profile.DataFormat == Complex16bit && stream.AlternIQStream &&
         std::isfinite(stream.IQS_ScaleToV);
 }
 
-extern "C" int san90_next(San90Device* state, int16_t* dest, uint32_t capacity,
+static int san90_iqs_fetch(San90Device* state, IQStream_TypeDef* stream) {
+    if (!state->trace_first_read) return IQS_GetIQStream_PM1(&state->handle, stream);
+    state->trace_first_read = false;
+    const int status = san90_trace_iqs_call("first IQS_GetIQStream_PM1",
+        [&] { return IQS_GetIQStream_PM1(&state->handle, stream); });
+    std::fprintf(stderr, "IQS diagnostic: first packet samples=%u bytes=%u format=%d\n",
+                 stream->IQS_StreamInfo.PacketSamples, stream->IQS_StreamInfo.PacketDataSize,
+                 static_cast<int>(stream->IQS_Profile.DataFormat));
+    std::fflush(stderr);
+    return status;
+}
+
+WEBSA_SHIM_EXPORT int san90_next(San90Device* state, int16_t* dest, uint32_t capacity,
                             San90PacketInfo* info) {
     SAN90_DISPATCH(state, san90_next(state, dest, capacity, info));
     if (!san90_session.usable()) return -8;
-    if (!state || !state->triggered || !dest || !info || capacity < 16240) return -100;
+    if (!state || !state->triggered || !dest || !info || capacity < state->packet_samples) return -100;
     IQStream_TypeDef stream{};
+#ifndef _WIN32
     websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::fetch);
     // Stop before the vendor sees a synthetic USB overflow: the physical
     // device remains valid. A full ring cannot empty during one vendor read.
     if (websa_iqs_usb::current().handoff_overflow()) {
         websa_iqs_usb::current().stop();return -130;
     }
-    int status = IQS_GetIQStream_PM1(&state->handle, &stream);
+#endif
+    int status = san90_iqs_fetch(state, &stream);
     if (status && status != APIRETVAL_WARNING_IFOverflow) return status;
     auto n = stream.IQS_StreamInfo.PacketSamples;
-    if (!san90_valid_iqs_packet(stream, capacity)) return -103;
+    if (!san90_valid_iqs_packet(stream, state->packet_samples, capacity)) return -103;
     std::memcpy(dest, stream.AlternIQStream, n * 2 * sizeof(int16_t));
     info->stamp = stream.IQS_TriggerInfo.SysTimerCountOfFirstDataPoint;
     info->samples = n;
@@ -551,7 +656,7 @@ extern "C" int san90_next(San90Device* state, int16_t* dest, uint32_t capacity,
     return 0;
 }
 
-extern "C" int san90_iqs_timing_v1(const San90Device* state, San90IqsTiming* timing) {
+WEBSA_SHIM_EXPORT int san90_iqs_timing_v1(const San90Device* state, San90IqsTiming* timing) {
     SAN90_DISPATCH(state, san90_iqs_timing_v1(state, timing));
     if (!state || !timing) return -100;
     *timing = state->timing;
@@ -559,7 +664,7 @@ extern "C" int san90_iqs_timing_v1(const San90Device* state, San90IqsTiming* tim
 }
 
 
-extern "C" int san90_next_v2(San90Device* state, int16_t* dest, uint32_t capacity,
+WEBSA_SHIM_EXPORT int san90_next_v2(San90Device* state, int16_t* dest, uint32_t capacity,
                                 San90PacketInfo* info, double* freq, float* power,
                                 uint32_t spectrum_capacity, uint32_t* spectrum_points) {
     SAN90_DISPATCH(state, san90_next_v2(state, dest, capacity, info, freq, power, spectrum_capacity, spectrum_points));
@@ -574,28 +679,32 @@ extern "C" int san90_next_v2(San90Device* state, int16_t* dest, uint32_t capacit
         state->last_iqs_entry = entered;
         state->has_iqs_entry = true;
     }
-    if (!state || !state->triggered || !dest || !info || !spectrum_points || capacity < 16240)
+    if (!state || !state->triggered || !dest || !info || !spectrum_points || capacity < state->packet_samples)
         return -100;
     *spectrum_points = 0;
     IQStream_TypeDef stream{};
     const auto fetch_started = San90Clock::now();
+#ifndef _WIN32
     websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::fetch);
     // Stop before the vendor sees a synthetic USB overflow: the physical
     // device remains valid. A full ring cannot empty during one vendor read.
     if (websa_iqs_usb::current().handoff_overflow()) {
         websa_iqs_usb::current().stop();return -130;
     }
-    int status = IQS_GetIQStream_PM1(&state->handle, &stream);
+#endif
+    int status = san90_iqs_fetch(state, &stream);
     state->timing.fetch_ns = san90_elapsed_ns(fetch_started);
     state->timing.fetch_status = status;
     state->timing.measured |= 2;
     if (status && status != APIRETVAL_WARNING_IFOverflow) return status;
     auto n = stream.IQS_StreamInfo.PacketSamples;
-    if (!san90_valid_iqs_packet(stream, capacity)) return -103;
+    if (!san90_valid_iqs_packet(stream, state->packet_samples, capacity)) return -103;
     int warning = (status == APIRETVAL_WARNING_IFOverflow || stream.DeviceState.IFOverflow)
         ? APIRETVAL_WARNING_IFOverflow : 0;
     const auto copy_started = San90Clock::now();
+#ifndef _WIN32
     websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::copy);
+#endif
     std::memcpy(dest, stream.AlternIQStream, n * 2 * sizeof(int16_t));
     state->timing.memcpy_ns = san90_elapsed_ns(copy_started);
     state->timing.measured |= 4;
@@ -606,14 +715,18 @@ extern "C" int san90_next_v2(San90Device* state, int16_t* dest, uint32_t capacit
         if (!freq || !power || spectrum_capacity < state->fft_points) return -107;
         IQStream_TypeDef fft = stream;
         fft.IQS_Profile.CenterFreq_Hz = state->center_hz;
-        fft.IQS_Profile.TriggerLength = n;
-        fft.IQS_StreamInfo.PacketSamples = n;
-        fft.IQS_StreamInfo.StreamSamples = n;
-        fft.IQS_StreamInfo.PacketDataSize = n * 4;
+        // The inline spectrum context uses a fixed FFT size. The complete packet
+        // has already been copied to the IQ consumer, including any extra samples.
+        fft.IQS_Profile.TriggerLength = san90_iqs_fft_samples;
+        fft.IQS_StreamInfo.PacketSamples = san90_iqs_fft_samples;
+        fft.IQS_StreamInfo.StreamSamples = san90_iqs_fft_samples;
+        fft.IQS_StreamInfo.PacketDataSize = san90_iqs_fft_samples * 4;
         fft.IQS_StreamInfo.IQSampleRate = state->sample_rate_hz;
         fft.IQS_StreamInfo.Bandwidth = state->bandwidth_hz;
         const auto fft_started = San90Clock::now();
+#ifndef _WIN32
         websa_iqs_usb::current().owner_phase(websa_iqs_usb::OwnerPhase::fft);
+#endif
         status = DSP_FFT_IQSToSpectrum(&state->dsp, &fft, freq, power);
         state->timing.fft_ns = san90_elapsed_ns(fft_started);
         state->timing.fft_status = status;
@@ -632,7 +745,7 @@ extern "C" int san90_next_v2(San90Device* state, int16_t* dest, uint32_t capacit
 // Independent display-only DSP contexts. These never access a device/session and
 // are owned by the display worker, so a long transform cannot delay IQ fetching.
 struct San90DisplayFft { void* dsp = nullptr; uint32_t size = 0, points = 0; };
-extern "C" int san90_display_fft_open_v1(void** out, uint32_t size, uint32_t* points, double* rbw) {
+WEBSA_SHIM_EXPORT int san90_display_fft_open_v1(void** out, uint32_t size, uint32_t* points, double* rbw) {
     if (!out || !points || !rbw || (size != 32768 && size != 65536 && size != 16240)) return -120;
     *out = nullptr;
     // This independent worker bypasses San90Session's exception barrier.
@@ -656,7 +769,7 @@ extern "C" int san90_display_fft_open_v1(void** out, uint32_t size, uint32_t* po
     if (status) { if (s->dsp) DSP_Close(&s->dsp); delete s; return status; }
     s->size = size; s->points = *points; *out = s; return 0;
 }
-extern "C" int san90_display_fft_execute_v1(void* handle, const int16_t* iq, uint32_t samples,
+WEBSA_SHIM_EXPORT int san90_display_fft_execute_v1(void* handle, const int16_t* iq, uint32_t samples,
     float scale, double center, double rate, double bandwidth, double* freq, float* power, uint32_t capacity) {
     auto* s = static_cast<San90DisplayFft*>(handle);
     if (!s || !iq || samples != s->size || capacity < s->points || !freq || !power
@@ -671,14 +784,14 @@ extern "C" int san90_display_fft_execute_v1(void* handle, const int16_t* iq, uin
     stream.IQS_StreamInfo.Bandwidth = bandwidth;
     return DSP_FFT_IQSToSpectrum(&s->dsp, &stream, freq, power);
 }
-extern "C" int san90_display_fft_close_v1(void* handle) {
+WEBSA_SHIM_EXPORT int san90_display_fft_close_v1(void* handle) {
     auto* s = static_cast<San90DisplayFft*>(handle);
     if (!s) return 0;
     int status = DSP_Close(&s->dsp); delete s; return status;
 }
 
 // IQ, spectrum and metadata share one SDK-thread dispatch and one packet boundary.
-extern "C" int san90_next_v3(San90Device* state, int16_t* dest, uint32_t capacity,
+WEBSA_SHIM_EXPORT int san90_next_v3(San90Device* state, int16_t* dest, uint32_t capacity,
                                 San90PacketInfo* info, double* freq, float* power,
                                 uint32_t spectrum_capacity, uint32_t* spectrum_points,
                                 San90IqsTiming* timing, int* warning) {
@@ -706,14 +819,14 @@ struct San90IqsBatchSlot {
     int warning;
     int status;
 };
-extern "C" int san90_next_batch_v1(San90Device* state, San90IqsBatchSlot* slots,
+WEBSA_SHIM_EXPORT int san90_next_batch_v1(San90Device* state, San90IqsBatchSlot* slots,
                                    uint32_t count, uint32_t* attempted) {
     SAN90_DISPATCH(state, san90_next_batch_v1(state, slots, count, attempted));
     if (!state || !slots || !attempted || count == 0 || count > 4) return -100;
     *attempted = 0;
     // Validate the whole caller geometry before consuming any source sample.
     for (uint32_t i = 0; i < count; ++i)
-        if (!slots[i].iq || slots[i].capacity < 16240) return -100;
+        if (!slots[i].iq || slots[i].capacity < state->packet_samples) return -100;
     for (uint32_t i = 0; i < count; ++i) {
         auto& slot = slots[i];
         slot.info = {}; slot.timing = {}; slot.warning = 0;
@@ -807,7 +920,7 @@ static int san90_rta_prepare_buffers(San90RtaDevice* state, bool accumulate) {
     return 0;
 }
 
-extern "C" int san90_rta_open_v1(San90RtaDevice** out, double center_hz, double span_hz,
+WEBSA_SHIM_EXPORT int san90_rta_open_v1(San90RtaDevice** out, double center_hz, double span_hz,
                                    double* start_hz, double* stop_hz, uint32_t* points) {
     SAN90_DISPATCH(nullptr, san90_rta_open_v1(out, center_hz, span_hz, start_hz, stop_hz, points));
     if (!out || !start_hz || !stop_hz || !points || !std::isfinite(center_hz) ||
@@ -867,7 +980,7 @@ fail:
     return status;
 }
 
-extern "C" int san90_rta_next_v1(San90RtaDevice* state, double* freq, float* power,
+WEBSA_SHIM_EXPORT int san90_rta_next_v1(San90RtaDevice* state, double* freq, float* power,
                                   uint32_t capacity, uint32_t* points) {
     SAN90_DISPATCH(state, san90_rta_next_v1(state, freq, power, capacity, points));
     if (!san90_session.usable()) return -8;
@@ -886,7 +999,7 @@ extern "C" int san90_rta_next_v1(San90RtaDevice* state, double* freq, float* pow
     return 0;
 }
 
-extern "C" int san90_rta_close_v1(San90RtaDevice* state) {
+WEBSA_SHIM_EXPORT int san90_rta_close_v1(San90RtaDevice* state) {
     SAN90_DISPATCH(state, san90_rta_close_v1(state));
     if (!state) return -100;
     int status = san90_session.usable() ? RTA_BusTriggerStop(&state->handle) : 0;
@@ -1014,7 +1127,7 @@ static int san90_rta_configure(San90RtaDevice* state, const San90RtaRequest& r,
     return 0;
 }
 
-extern "C" int san90_rta_open_v2(San90RtaDevice** out, const San90RtaRequest* request,
+WEBSA_SHIM_EXPORT int san90_rta_open_v2(San90RtaDevice** out, const San90RtaRequest* request,
                                    San90RtaActual* actual) {
     SAN90_DISPATCH(nullptr, san90_rta_open_v2(out, request, actual));
     if (!out || !request || !actual || !std::isfinite(request->center_hz) ||
@@ -1043,7 +1156,7 @@ extern "C" int san90_rta_open_v2(San90RtaDevice** out, const San90RtaRequest* re
     return 0;
 }
 
-extern "C" int san90_rta_reconfig_v1(San90RtaDevice* state, const San90RtaRequest* request,
+WEBSA_SHIM_EXPORT int san90_rta_reconfig_v1(San90RtaDevice* state, const San90RtaRequest* request,
                                        San90RtaActual* actual) {
     SAN90_DISPATCH(state, san90_rta_reconfig_v1(state, request, actual));
     if (!san90_session.usable()) return -8;
@@ -1053,7 +1166,7 @@ extern "C" int san90_rta_reconfig_v1(San90RtaDevice* state, const San90RtaReques
     return san90_rta_configure(state, *request, actual);
 }
 
-extern "C" int san90_rta_trigger_actual_v1(San90RtaDevice* state,
+WEBSA_SHIM_EXPORT int san90_rta_trigger_actual_v1(San90RtaDevice* state,
                                             San90RtaTriggerActual* actual) {
     SAN90_DISPATCH(state, san90_rta_trigger_actual_v1(state, actual));
     if (!state || !actual) return -100;
@@ -1061,7 +1174,7 @@ extern "C" int san90_rta_trigger_actual_v1(San90RtaDevice* state,
     return 0;
 }
 
-extern "C" int san90_rta_next_v2(San90RtaDevice* state, double* freq, float* power,
+WEBSA_SHIM_EXPORT int san90_rta_next_v2(San90RtaDevice* state, double* freq, float* power,
                                   uint32_t capacity, uint32_t* points) {
     SAN90_DISPATCH(state, san90_rta_next_v2(state, freq, power, capacity, points));
     if (!san90_session.usable()) return -8;
@@ -1124,7 +1237,7 @@ struct San90RtaPacket {
 };
 
 // All acquired spectra, byte-quantized by the FPGA. A null buffer queries capacity.
-extern "C" int san90_rta_packet_v1(San90RtaDevice* state, uint8_t* samples,
+WEBSA_SHIM_EXPORT int san90_rta_packet_v1(San90RtaDevice* state, uint8_t* samples,
                                    uint32_t capacity, San90RtaPacket* packet) {
     SAN90_DISPATCH(state, san90_rta_packet_v1(state, samples, capacity, packet));
     if (!state || !packet || !state->packet_serial) return -100;
@@ -1142,7 +1255,7 @@ extern "C" int san90_rta_packet_v1(San90RtaDevice* state, uint8_t* samples,
     return 0;
 }
 
-extern "C" int san90_rta_reconfig_v2(San90RtaDevice* state, const San90RtaRequest* request,
+WEBSA_SHIM_EXPORT int san90_rta_reconfig_v2(San90RtaDevice* state, const San90RtaRequest* request,
                                        San90RtaActual* actual) {
     SAN90_DISPATCH(state, san90_rta_reconfig_v2(state, request, actual));
     if (!san90_session.usable()) return -8;
@@ -1220,7 +1333,7 @@ struct San90SwpActual {
     int refclk_src;
 };
 
-extern "C" int san90_swp_front_end_actual_v1(San90SwpDevice* state, San90FrontEndActual* actual) {
+WEBSA_SHIM_EXPORT int san90_swp_front_end_actual_v1(San90SwpDevice* state, San90FrontEndActual* actual) {
     SAN90_DISPATCH(state, san90_swp_front_end_actual_v1(state, actual));
     if (!san90_session.usable()) return -8;
     if (!state || !actual || san90_session.active != state) return -100;
@@ -1285,7 +1398,7 @@ static bool san90_swp_request_ok(const San90SwpRequest* r) {
            std::isfinite(r->rbw_hz) && std::isfinite(r->vbw_hz) && std::isfinite(r->sweep_time);
 }
 
-extern "C" int san90_swp_open_v2(San90SwpDevice** out, const San90SwpRequest* request,
+WEBSA_SHIM_EXPORT int san90_swp_open_v2(San90SwpDevice** out, const San90SwpRequest* request,
                                    San90SwpActual* actual) {
     SAN90_DISPATCH(nullptr, san90_swp_open_v2(out, request, actual));
     if (!out || !actual || !san90_swp_request_ok(request)) return -100;
@@ -1312,7 +1425,7 @@ extern "C" int san90_swp_open_v2(San90SwpDevice** out, const San90SwpRequest* re
     return 0;
 }
 
-extern "C" int san90_swp_reconfig_v1(San90SwpDevice* state, const San90SwpRequest* request,
+WEBSA_SHIM_EXPORT int san90_swp_reconfig_v1(San90SwpDevice* state, const San90SwpRequest* request,
                                        San90SwpActual* actual) {
     SAN90_DISPATCH(state, san90_swp_reconfig_v1(state, request, actual));
     if (!san90_session.usable()) return -8;
@@ -1356,7 +1469,7 @@ static int san90_swp_fetch(San90SwpDevice* state, bool& available) {
 
 // One sweep cut to the requested start/stop (Python device.py fetch_sweep): the vendor trace
 // can extend past the request and below 0 Hz; unfilled bins read exactly 0.0 dBm -> NaN.
-extern "C" int san90_swp_next_v2(San90SwpDevice* state, double* freq, float* power,
+WEBSA_SHIM_EXPORT int san90_swp_next_v2(San90SwpDevice* state, double* freq, float* power,
                                    uint32_t capacity, uint32_t* points,
                                    double* refclk_ppm) {
     SAN90_DISPATCH(state, san90_swp_next_v2(state, freq, power, capacity, points, refclk_ppm));
@@ -1393,7 +1506,7 @@ struct San90DeviceInfo {
     uint32_t model, hw, mfw, ffw, bus_speed, bus_ver, api_ver, pmu, agu;
     int32_t warnings, errors;
 };
-extern "C" int san90_device_info_v1(void* session, San90DeviceInfo* info) {
+WEBSA_SHIM_EXPORT int san90_device_info_v1(void* session, San90DeviceInfo* info) {
     SAN90_DISPATCH(session, san90_device_info_v1(session, info));
     if (!session || !info) return -100;
     if (!san90_session.usable()) return -8;
@@ -1408,7 +1521,7 @@ extern "C" int san90_device_info_v1(void* session, San90DeviceInfo* info) {
 
 // Device power-on SWP defaults (Python device.py load_preset_defaults). Enum fields are
 // returned as raw header values; the caller maps them to wire names.
-extern "C" int san90_swp_defaults_v1(void* session, double* center_hz, double* span_hz,
+WEBSA_SHIM_EXPORT int san90_swp_defaults_v1(void* session, double* center_hz, double* span_hz,
                                        double* ref_dbm, double* rbw_hz, double* vbw_hz,
                                        int* points, int* atten, int* window, int* rbw_mode,
                                        int* vbw_mode, int* spur, int* frame_detector,
@@ -1450,7 +1563,7 @@ extern "C" int san90_swp_defaults_v1(void* session, double* center_hz, double* s
     return 0;
 }
 
-extern "C" int san90_swp_open_v1(San90SwpDevice** out,
+WEBSA_SHIM_EXPORT int san90_swp_open_v1(San90SwpDevice** out,
                                    double center_hz, double span_hz, double ref_dbm,
                                    double rbw_hz, int rbw_mode, double vbw_hz, int vbw_mode,
                                    int window, int atten, int preamp, int ifgain,
@@ -1538,7 +1651,7 @@ fail:
     return status;
 }
 
-extern "C" int san90_swp_next_v1(San90SwpDevice* state, double* freq, float* power,
+WEBSA_SHIM_EXPORT int san90_swp_next_v1(San90SwpDevice* state, double* freq, float* power,
                                    uint32_t capacity, uint32_t* points) {
     SAN90_DISPATCH(state, san90_swp_next_v1(state, freq, power, capacity, points));
     if (!san90_session.usable()) return -8;
@@ -1553,7 +1666,7 @@ extern "C" int san90_swp_next_v1(San90SwpDevice* state, double* freq, float* pow
     return status;
 }
 
-extern "C" int san90_swp_close_v1(San90SwpDevice* state) {
+WEBSA_SHIM_EXPORT int san90_swp_close_v1(San90SwpDevice* state) {
     SAN90_DISPATCH(state, san90_swp_close_v1(state));
     if (!state) return -100;
     int status = san90_session.release(&state->handle);
@@ -1576,7 +1689,7 @@ struct San90PnmDevice {
     uint32_t stall = 0;
 };
 
-extern "C" int san90_pnm_open_v1(San90PnmDevice** out, double center_hz, float threshold,
+WEBSA_SHIM_EXPORT int san90_pnm_open_v1(San90PnmDevice** out, double center_hz, float threshold,
                                    double rbw_ratio, double start_offset, double stop_offset,
                                    uint32_t trace_average, uint32_t* trace_points,
                                    uint32_t* segments, uint32_t* partial_updates) {
@@ -1633,7 +1746,7 @@ fail:
 //   0 = new data (fields filled, progress/done set), 1 = no update yet (call again),
 //   anything else = hard error. The cycle machine (start/done/stall-restart) lives here so
 //   every vendor call stays on the owning thread.
-extern "C" int san90_pnm_next_v1(San90PnmDevice* state, double* carrier_hz,
+WEBSA_SHIM_EXPORT int san90_pnm_next_v1(San90PnmDevice* state, double* carrier_hz,
                                    float* carrier_power, double* offset, float* pn,
                                    uint32_t capacity, uint32_t* points, float* ref_level,
                                    uint32_t* progress_pct, uint32_t* done) {
@@ -1687,7 +1800,7 @@ extern "C" int san90_pnm_next_v1(San90PnmDevice* state, double* carrier_hz,
     return 0;
 }
 
-extern "C" int san90_pnm_close_v1(San90PnmDevice* state) {
+WEBSA_SHIM_EXPORT int san90_pnm_close_v1(San90PnmDevice* state) {
     SAN90_DISPATCH(state, san90_pnm_close_v1(state));
     if (!state) return -100;
     // The cycle flag can be cleared by completion or a stall while the device
@@ -1702,7 +1815,7 @@ extern "C" int san90_pnm_close_v1(San90PnmDevice* state) {
 
 // GNSS snapshot on any session state: every San90*Device struct's FIRST member is the
 // vendor device handle (do not reorder), so one entry point serves SWP/RTA/PNM/IQS.
-extern "C" int san90_gnss_v1(void* state, int* lock, int* sats, int* docxo,
+WEBSA_SHIM_EXPORT int san90_gnss_v1(void* state, int* lock, int* sats, int* docxo,
                                int* docxo_mode, int* antenna, float* latitude,
                                float* longitude, int* altitude, int* year, int* month,
                                int* day, int* hour, int* minute, int* second) {
@@ -1732,7 +1845,7 @@ extern "C" int san90_gnss_v1(void* state, int* lock, int* sats, int* docxo,
 }
 
 // Explicit streaming-safe ABI: the vendor snapshot is refreshed by packet reception.
-extern "C" int san90_gnss_cached_v1(void* state, int* lock, int* sats, int* docxo,
+WEBSA_SHIM_EXPORT int san90_gnss_cached_v1(void* state, int* lock, int* sats, int* docxo,
                                int* docxo_mode, int* antenna, float* latitude,
                                float* longitude, int* altitude, int* year, int* month,
                                int* day, int* hour, int* minute, int* second) {
@@ -1740,9 +1853,10 @@ extern "C" int san90_gnss_cached_v1(void* state, int* lock, int* sats, int* docx
                          longitude, altitude, year, month, day, hour, minute, second);
 }
 
-extern "C" int san90_close(San90Device* state) {
+WEBSA_SHIM_EXPORT int san90_close(San90Device* state) {
     SAN90_DISPATCH(state, san90_close(state));
     if (!state) return -100;
+#ifndef _WIN32
     auto& usb = websa_iqs_usb::current();
     usb.stop();
     const auto stats = usb.stats();
@@ -1752,6 +1866,7 @@ extern "C" int san90_close(San90Device* state) {
             static_cast<unsigned long long>(stats.failed), static_cast<unsigned long long>(stats.cancelled),
             websa_iqs_usb::Pipeline::transfer_count(), static_cast<unsigned long long>(stats.peak_queued_packets),
             stats.max_queue_age_ns / 1e6, static_cast<unsigned long long>(stats.discarded));
+#endif
     int status = san90_session.usable() && state->triggered ? IQS_BusTriggerStop(&state->handle) : 0;
     if (status) san90_open_failed(status);
     if (state->dsp) {

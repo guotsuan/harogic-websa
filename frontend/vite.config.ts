@@ -5,8 +5,9 @@ import { defineConfig } from 'vite';
 export default defineConfig(({ mode }) => {
   // Use checkout bytes, including local changes, rather than pointing dirty
   // builds at an older remote commit. Vitest does not generate build artifacts.
+  const python = process.env.WEBSA_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   const legal = mode === 'test' ? { source_id: 'test', archive: 'test.tar.gz' }
-    : JSON.parse(execFileSync('python3', [fileURLToPath(new URL('../tools/prepare_legal.py', import.meta.url))], { encoding: 'utf8' }));
+    : JSON.parse(execFileSync(python, [fileURLToPath(new URL('../tools/prepare_legal.py', import.meta.url))], { encoding: 'utf8' }));
   return {
     plugins: [{
       name: 'websa-license-source-links',

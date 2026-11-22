@@ -15,6 +15,7 @@ npm-debug.log*
 # Rust/WASM 构建产物（入库的是发布后的 frontend/public/dsp.wasm）
 dsp/core/target/
 backend/target/
+/windows-build/
 
 # DFN 降噪运行时构建产物（入库的是发布后的 public/dfn 与 public/models）
 dsp/deepfilter/target/

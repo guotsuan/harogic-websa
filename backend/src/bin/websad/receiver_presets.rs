@@ -115,10 +115,10 @@ impl Store {
         let result = (|| -> std::io::Result<()> {
             file.write_all(&bytes)?;
             file.sync_all()?;
-            std::fs::rename(&temporary, &self.path)?;
+            super::storage_publish::rename(&temporary, &self.path)?;
             // Publish the renamed state even if directory sync reports a durability error.
             self.data = next;
-            std::fs::File::open(self.path.parent().unwrap())?.sync_all()
+            super::storage_publish::sync_directory(self.path.parent().unwrap())
         })();
         if let Err(error) = result {
             let _ = std::fs::remove_file(temporary);

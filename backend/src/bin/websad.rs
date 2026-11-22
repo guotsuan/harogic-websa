@@ -2,6 +2,8 @@
 // Project-owned code: AGPL-3.0-only with ../../../LICENSE-EXCEPTION; scope in ../../../LICENSING.md.
 //! WebSA-compatible service with captured golden-fixture defaults for STATUS and
 //! schema contract fields.
+#[path = "../sdk_library.rs"]
+mod sdk_library;
 #[path = "../hardware_iqs.rs"]
 mod hardware_iqs;
 #[path = "../hardware_pnm.rs"]
@@ -49,6 +51,8 @@ mod service_cost;
 mod service_power;
 #[path = "websad/subscriber_stream.rs"]
 mod subscriber_stream;
+#[path = "websad/storage_publish.rs"]
+mod storage_publish;
 #[path = "websad/recording.rs"]
 mod recording;
 #[path = "websad/recording_read.rs"]
@@ -81,7 +85,13 @@ use service_routes::api_config;
 #[cfg(test)]
 #[path = "websad/sixteen_channel_tests.rs"]
 mod sixteen_channel_tests;
+#[path = "websad/server_bind.rs"]
+mod server_bind;
+#[cfg(not(windows))]
 #[path = "websad/server_mode.rs"]
+mod server_mode;
+#[cfg(windows)]
+#[path = "websad/server_mode_windows.rs"]
 mod server_mode;
 #[path = "websad/receiver_limits.rs"]
 mod receiver_limits;
@@ -972,16 +982,20 @@ impl DevState {
         }
     }
 
-    /// Frequency range: the model table, widened to the device's own full span when known
-    /// (Python apply_caps_from_defaults; the SAN-90 sweeps 8 kHz - 9.02 GHz).
+    /// Extend the fallback SAN-90 range using the SDK model and learned SWP defaults.
     fn freq_limits(&self) -> (f64, f64) {
         let (mut lo, mut hi) = (
             self.caps()["fmin"].as_f64().unwrap_or(9e3),
             self.caps()["fmax"].as_f64().unwrap_or(9e9),
         );
+        match self.device_detail.as_ref().and_then(|detail| detail["model"].as_u64()) {
+            Some(10..=15) => hi = hi.max(9.5e9), // E90 family
+            Some(20..=23) => hi = hi.max(20e9),  // E200 family
+            _ => (),
+        }
         if let Some(d) = &self.device_defaults {
             let (dlo, dhi) = (d.center - d.span / 2.0, d.center + d.span / 2.0);
-            if dhi > dlo {
+            if dlo.is_finite() && dhi.is_finite() && dhi > dlo {
                 lo = lo.min(dlo);
                 hi = hi.max(dhi);
             }
@@ -2254,6 +2268,12 @@ fn signed_bin(freq: f64, center: f64) -> i64 {
 const SDR_PACKET_SAMPLES: usize = 16_240;
 const SDR_BATCH_PACKETS: usize = 4;
 const SDR_BATCH_SAMPLES: usize = SDR_PACKET_SAMPLES * SDR_BATCH_PACKETS;
+const SDR_MAX_BATCH_SAMPLES: usize = hardware_iqs::MAX_PACKET_SAMPLES * SDR_BATCH_PACKETS;
+
+fn valid_capture_sample_count(count: usize) -> bool {
+    matches!(count, SDR_PACKET_SAMPLES | SDR_BATCH_SAMPLES
+        | hardware_iqs::MAX_PACKET_SAMPLES | SDR_MAX_BATCH_SAMPLES)
+}
 
 struct Ddc {
     stream: Box<PfbStream>,
@@ -2275,6 +2295,7 @@ struct Ddc {
     capture_scratch: Vec<i16>,
     stamp_gaps: u64,
     last_stamp: Option<u64>,
+    last_packet_samples: usize,
     /// IQS configuration generation of the packets that this plan accepts.
     generation: u64,
     /// Device-side IQS decimate (1 = full rate). The stamp counts 2 sample clocks
@@ -2380,7 +2401,7 @@ impl Ddc {
             }
         }
         let epoch = allocate_dsp_epoch()?;
-        let packet_capacity = if fs >= 15_625_000.0 { SDR_BATCH_SAMPLES } else { SDR_PACKET_SAMPLES };
+        let packet_capacity = if fs >= 15_625_000.0 { SDR_MAX_BATCH_SAMPLES } else { hardware_iqs::MAX_PACKET_SAMPLES };
         let stream = PfbStream::with_taps(fs, packet_capacity, bins, epoch as u64, taps_per_phase).ok_or("PFB unavailable")?;
         let rate = stream.sample_rate / decimate as f64;
         let hop = stream.input_hop();
@@ -2425,6 +2446,7 @@ impl Ddc {
             capture_scratch: Vec::new(),
             stamp_gaps: 0,
             last_stamp: None,
+            last_packet_samples: SDR_PACKET_SAMPLES,
             generation,
             hardware: hardware.take(),
             capture_failed: false,
@@ -2739,7 +2761,7 @@ impl Ddc {
                     }
                     let packet = capture.next()?;
                     self.pipeline_timing.received = Some((std::time::Instant::now(), self.next_seq, packet.stamp,
-                        self.input_pos + (index * N) as u64));
+                        self.input_pos + (raw.len() / 2) as u64));
                     // Packets queued before an IQS reconfigure belong to the old centre.
                     if packet.generation >= self.generation {
                         break packet;
@@ -2748,7 +2770,7 @@ impl Ddc {
                 if let Some(last) = self.last_stamp {
                     // Packet stamps count raw sample clocks: two ticks per complex sample
                     // times device decimation.
-                    let expected = 2 * N as u64 * self.device_decimate;
+                    let expected = 2 * self.last_packet_samples as u64 * self.device_decimate;
                     let delta = packet.stamp.saturating_sub(last);
                     if delta.abs_diff(expected) > 8 {
                         self.stamp_gaps += 1;
@@ -2760,6 +2782,7 @@ impl Ddc {
                     }
                 }
                 self.last_stamp = Some(packet.stamp);
+                self.last_packet_samples = packet.iq.len() / 2;
                 if let Some(tap) = &mut self.scan_tap {
                     tap.push(display_fft::Meta {epoch:self.stream.epoch(),generation:packet.generation,center:self.capture_center,rate:self.stream.input_sample_rate(),bandwidth:self.usable_bandwidth,scale:packet.scale_to_v},packet.seq,packet.stamp,&packet.iq,packet.warning);
                 }
@@ -2806,7 +2829,7 @@ impl Ddc {
     /// Raw capture input follows the same PFB, fine filters and framing for hardware and probes.
     fn process_capture_packet(&mut self, raw: &[i16], stamp:u64) -> Result<IqFrames,String> {
         let count = raw.len()/2;
-        if !matches!(count, SDR_PACKET_SAMPLES | SDR_BATCH_SAMPLES) || raw.len()%2 != 0 {
+        if !valid_capture_sample_count(count) || raw.len()%2 != 0 {
             return Err("invalid capture packet size".into());
         }
         self.input_pos += count as u64;

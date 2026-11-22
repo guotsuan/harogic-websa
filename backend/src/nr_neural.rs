@@ -15,12 +15,16 @@ static ORT: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn runtime() -> Result<(), String> {
     ORT.get_or_init(|| {
+        #[cfg(windows)]
+        let library = "onnxruntime.dll";
+        #[cfg(not(windows))]
         let library = "libonnxruntime.so.1.23.2";
         let mut paths = Vec::new();
         if let Some(path) = std::env::var_os("WEBSA_ORT_DYLIB") { paths.push(PathBuf::from(path)); }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() { paths.push(dir.join(library)); }
         }
+        #[cfg(not(windows))]
         paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime/linux-x86_64").join(library));
         let path = paths.into_iter().find(|p| p.is_file()).ok_or_else(|| format!("missing native {library}"))?;
         ort::init_from(path).map_err(|e| e.to_string())?.with_name("websa-listener-nr").commit();

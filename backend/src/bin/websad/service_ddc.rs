@@ -140,7 +140,7 @@ impl Ddc {
         }
         super::service_cost::admit_service(configs,fs,taps,bins.len())?;
         let epoch = allocate_dsp_epoch()?;
-        let packet_capacity = if fs >= 15_625_000.0 { SDR_BATCH_SAMPLES } else { SDR_PACKET_SAMPLES };
+        let packet_capacity = if fs >= 15_625_000.0 { SDR_MAX_BATCH_SAMPLES } else { hardware_iqs::MAX_PACKET_SAMPLES };
         let stream = PfbStream::with_taps(fs, packet_capacity, bins, epoch as u64, taps).ok_or("PFB unavailable")?;
         let mut bank = FineBank::new(&stream, bandwidth, packet_capacity / stream.input_hop() + 2,
             MAX_CHANNELS, COARSE_RATE * MAX_CHANNELS as f64, CONSUMER_BUDGET).ok_or("fine bank unavailable")?;
@@ -185,7 +185,7 @@ impl Ddc {
         let cost_profile=None;
         Ok(Self { stream:Box::new(stream),fine:Some(fine),fine_worker:None,direct,carry:Vec::new(),pan:Vec::new(),scan_tap:None,default_fft:None,display_fft:None,display_fft_error:None,
             capture_center:center,usable_bandwidth:bandwidth,decimate:1,listen:primary.freq,next_seq:0,
-            input_pos:0,capture_scratch:Vec::new(),stamp_gaps:0,last_stamp:None,generation,device_decimate:if hardware.is_some() {
+            input_pos:0,capture_scratch:Vec::new(),stamp_gaps:0,last_stamp:None,last_packet_samples:SDR_PACKET_SAMPLES,generation,device_decimate:if hardware.is_some() {
                 ((IQ_FS/fs).round() as u64).max(1) } else {1},hardware:hardware.take(),capture_failed:false,
             pipeline_timing:sdr_pipeline::PipelineTiming::new(fs),registry,
             #[cfg(test)]

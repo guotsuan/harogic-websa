@@ -57,7 +57,7 @@ impl HardwarePresentation {
             "capture_center":snapshot.capture_center,"capture_start":snapshot.capture_center-snapshot.usable_bandwidth/2.0,
             "capture_stop":snapshot.capture_center+snapshot.usable_bandwidth/2.0,
             "start":lo,"stop":hi,
-            "packet_samples":16240,"packet_bytes":64960,"pan_available":false,
+            "packet_samples":snapshot.packet_samples,"packet_bytes":snapshot.packet_samples * 4,"pan_available":false,
             "listen":self.listen,"demod":self.demod,"if_bw":self.if_bw,
             "ddc_decimate":snapshot.registry.iter().find(|c|c.channel==1).map(|c| snapshot.input_rate/c.output_rate),"ddc_batch":snapshot.batch_packets,
             "audio_rate":null,"deemph_us":self.deemph,

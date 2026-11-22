@@ -3,6 +3,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 
@@ -28,6 +29,7 @@ fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
     }
 }
 // The child must never hold a recording lane or archive reader indefinitely.
+#[cfg(unix)]
 pub(super) fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
     unsafe {
@@ -38,6 +40,7 @@ pub(super) fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 pub(super) fn write_pipe(pipe: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !bytes.is_empty() {
@@ -682,31 +685,9 @@ pub(super) fn read_pcm(
             .stderr(Stdio::null())
             .spawn()?,
     );
-    let mut output = decoder.0.stdout.take().unwrap();
-    nonblocking(&output)?;
+    let output = decoder.0.stdout.take().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut pcm = Vec::with_capacity(bytes as usize);
-    let mut buffer = [0; 65536];
-    loop {
-        cancelled(cancel)?;
-        if Instant::now() >= deadline {
-            return Err(io_error("audio decoding timed out"));
-        }
-        match output.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                if pcm.len() + n > bytes as usize {
-                    return Err(io_error("audio decoder exceeded requested range"));
-                }
-                pcm.extend_from_slice(&buffer[..n]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2))
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let pcm = read_decoder_output(output, bytes as usize, cancel, deadline)?;
     loop {
         cancelled(cancel)?;
         if Instant::now() >= deadline {
@@ -725,6 +706,74 @@ pub(super) fn read_pcm(
     }
     Ok(pcm)
 }
+#[cfg(unix)]
+fn read_decoder_output(
+    mut output: std::process::ChildStdout,
+    bytes: usize,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    nonblocking(&output)?;
+    let mut pcm = Vec::with_capacity(bytes);
+    let mut buffer = [0; 65536];
+    loop {
+        cancelled(cancel)?;
+        if Instant::now() >= deadline {
+            return Err(io_error("audio decoding timed out"));
+        }
+        match output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if pcm.len() + n > bytes {
+                    return Err(io_error("audio decoder exceeded requested range"));
+                }
+                pcm.extend_from_slice(&buffer[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pcm)
+}
+
+#[cfg(windows)]
+fn read_decoder_output(
+    output: std::process::ChildStdout,
+    bytes: usize,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    // Drop of the caller's Decoder kills and reaps FFmpeg if cancellation or
+    // timeout returns first, which also closes the reader's pipe.
+    let (send, receive) = mpsc::sync_channel(1);
+    std::thread::Builder::new().name("websa-audio-preview".into()).spawn(move || {
+        let mut pcm = Vec::with_capacity(bytes);
+        let result = output.take(bytes as u64 + 1).read_to_end(&mut pcm).and_then(|_| {
+            if pcm.len() > bytes {
+                return Err(io_error("audio decoder exceeded requested range"));
+            }
+            Ok(pcm)
+        });
+        let _ = send.send(result);
+    })?;
+    loop {
+        cancelled(cancel)?;
+        if Instant::now() >= deadline {
+            return Err(io_error("audio decoding timed out"));
+        }
+        match receive.recv_timeout(Duration::from_millis(10)) {
+            Ok(result) => return result,
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(RecvTimeoutError::Disconnected) => return Err(io_error("audio decoder reader exited")),
+        }
+    }
+}
+
 pub(super) fn visit_timeline(
     path: &FsPath,
     task: &Value,

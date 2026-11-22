@@ -175,7 +175,7 @@ impl DirectChannel {
         let delay=unsafe {websa_channelizer::channel_delay(handle)};
         Ok(Self {handle,id,rate:plan.output_rate,delay,decimate:plan.decimate as u64,
             epoch,origin,next_seq:seq,input:0,output:0,
-            scratch:vec![0.0;2*(super::SDR_BATCH_SAMPLES/plan.decimate as usize+2)],framer})
+            scratch:vec![0.0;2*(super::SDR_MAX_BATCH_SAMPLES/plan.decimate as usize+2)],framer})
     }
     pub(super) fn detach(&mut self,slot:u32)->Result<Self,String> {
         let framer=if slot==1 {BasebandFramer::new(self.id,self.epoch,0.0,self.rate)}
@@ -189,7 +189,7 @@ impl DirectChannel {
     pub fn process(&mut self,seq:u64,stamp:u64,input_index:u64,raw:&[i16])->Result<IqFrames,String> {
         let samples = raw.len()/2;
         if self.handle.is_null() || seq!=self.next_seq || input_index!=self.origin+self.input
-            || raw.len()%2 != 0 || !matches!(samples, super::SDR_PACKET_SAMPLES | super::SDR_BATCH_SAMPLES) {
+            || raw.len()%2 != 0 || !super::valid_capture_sample_count(samples) {
             return Err("direct source sequence/clock mismatch".into());
         }
         let first=self.origin.checked_add((self.output+1).checked_mul(self.decimate)
@@ -325,7 +325,7 @@ pub(super) struct Snapshot {
     pub generation: u64,
     pub batch_packets: usize,
     pub display_fft: Value,
-    pub taps: usize, pub device_decimate: u64, pub aux: Arc<[(u32, f64)]>, pub actual: Value,
+    pub taps: usize, pub device_decimate: u64, pub packet_samples: usize, pub aux: Arc<[(u32, f64)]>, pub actual: Value,
     front_end: Option<hardware_swp::FrontEndActual>,
     pub registry: Arc<[ChannelRegistryEntry]>,
     pub selected_bins: usize,
@@ -523,6 +523,7 @@ impl Ddc {
             batch_packets:self.capture_batch_packets(),
             display_fft:self.display_fft_status(),
             rate:self.channel_rate(), taps:self.stream.taps_per_phase(), device_decimate:self.device_decimate,
+            packet_samples:self.last_packet_samples,
             aux, actual:Value::Null, pool:self.stream.stats(), input_samples:self.input_pos,
             front_end:self.hardware.as_ref().and_then(|capture| capture.diagnostics().front_end()),
             registry:self.registry.clone(),
@@ -808,7 +809,7 @@ impl Pipeline {
                             ddc.pipeline_timing.output_send.observe(elapsed);
                             let seq = ddc.next_seq.saturating_sub(1);
                             let stamp = ddc.last_stamp.unwrap_or(ddc.input_pos);
-                            let input_index = ddc.input_pos.saturating_sub(16240);
+                            let input_index = ddc.input_pos.saturating_sub(ddc.last_packet_samples as u64);
                             ddc.pipeline_timing.observe_slow("output_send", seq, stamp, input_index, elapsed);
                             if let Some(capture) = &ddc.hardware {
                                 capture.note_output(seq, input_index, batch_frames, completed_at);
@@ -822,7 +823,7 @@ impl Pipeline {
                         *shared.lock() = snapshot;
                         let elapsed = started.elapsed();
                         ddc.pipeline_timing.snapshot_total.observe(elapsed);
-                        let (seq, stamp, input_index) = (ddc.next_seq.saturating_sub(1), ddc.last_stamp.unwrap_or(ddc.input_pos), ddc.input_pos.saturating_sub(16240));
+                        let (seq, stamp, input_index) = (ddc.next_seq.saturating_sub(1), ddc.last_stamp.unwrap_or(ddc.input_pos), ddc.input_pos.saturating_sub(ddc.last_packet_samples as u64));
                         ddc.pipeline_timing.observe_slow("producer_snapshot", seq, stamp, input_index, elapsed);
                         refreshed = Instant::now();
                     }

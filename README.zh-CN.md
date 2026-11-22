@@ -40,6 +40,8 @@ Python 用于崩溃监护、离线工具和测试。
 
 ## 试用
 
+Windows x64 的构建与启动见[运行指南](docs/zh-CN/WINDOWS.md)。
+
 首次 clone 后，准备 Linux 构建依赖并执行：
 
 ```bash

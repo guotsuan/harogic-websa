@@ -9,6 +9,7 @@ use std::sync::{
     Arc,
 };
 
+#[cfg(not(windows))]
 fn check_hardware_exclusive() -> Result<(), Box<dyn std::error::Error>> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
@@ -44,6 +45,46 @@ fn check_hardware_exclusive() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn check_hardware_exclusive() -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::{ffi::c_void, io, os::windows::io::FromRawHandle, ptr};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn SetLastError(code: u32);
+    }
+
+    // The named object is held for the service lifetime, including orderly SDK teardown.
+    let name: Vec<u16> = r"Global\WebSA.Harogic.Hardware".encode_utf16().chain([0]).collect();
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+    let handle = unsafe {
+        SetLastError(0);
+        CreateMutexW(ptr::null(), 0, name.as_ptr())
+    };
+    let status = io::Error::last_os_error();
+    if handle.is_null() {
+        return Err(status);
+    }
+    let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+    if status.raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "another WebSA instance owns the hardware"));
+    }
+    Ok(handle)
+}
+
+fn user_data_directory() -> std::path::PathBuf {
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|local| !local.is_empty()) {
+        return std::path::PathBuf::from(local);
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".local/share")
+        })
+}
+
 pub(super) async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve decoder dependencies before device state exists; command preflight uses cached
     // capabilities and must never run child probes while holding the device mutex.
@@ -57,25 +98,24 @@ pub(super) async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Reserve the endpoint before creating owners or opening persistent state.
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     let mut state = DevState::new(golden, schema);
+    #[cfg(windows)]
+    let mut hardware_guard = None;
     if let Ok(shim) = std::env::var("WEBSA_RUST_IQS_SHIM") {
         if shim.is_empty() {
             return Err("WEBSA_RUST_IQS_SHIM is empty".into());
         }
+        #[cfg(not(windows))]
         check_hardware_exclusive()?;
+        #[cfg(windows)]
+        {
+            hardware_guard = Some(check_hardware_exclusive()?);
+        }
         websa_channelizer::capture_scheduling::enable();
         state.hardware_shim = Some(shim);
     }
     let recording_root = std::env::var_os("WEBSA_RECORDING_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let data = std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-                        .join(".local/share")
-                });
-            data.join("harogic-websa/recordings").join(port.to_string())
-        });
+        .unwrap_or_else(|| user_data_directory().join("harogic-websa/recordings").join(port.to_string()));
     let presets_root = recording_root.clone();
     // Probe once during startup, before snapshots take the acquisition lock.
     let _ = recording::opus::available();
@@ -111,7 +151,7 @@ pub(super) async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     println!("websad listening on http://{host}:{port}");
     let publisher_app = app.clone();
     let publisher_stopping = stopping.clone();
-    serve_running(
+    let result = serve_running(
         listener,
         app,
         stopping,
@@ -119,9 +159,18 @@ pub(super) async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_signal(),
     )
     .await
-    .map_err(Into::into)
+    .map_err(Into::into);
+    #[cfg(windows)]
+    drop(hardware_guard);
+    result
 }
 
+#[cfg(windows)]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(not(windows))]
 async fn shutdown_signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");

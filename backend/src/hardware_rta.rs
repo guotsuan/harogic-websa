@@ -3,7 +3,7 @@
 //! retains the physical handle across mode owners and preserves vendor thread affinity.
 //! Buffers are bounded by the SDK-reported frame geometry.
 use std::{
-    ffi::{c_char, c_int, c_void, CStr, CString},
+    ffi::{c_int, c_void},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
@@ -15,17 +15,11 @@ use std::{
 
 use crate::hardware_swp::{
     call_owner, finish_owner, owner_slot_free, park_stuck_owner, read_defaults, FrontEnd, GnssInfo,
-    SdkFailure, SwpDefaults, LINK_LOST_STATUS, OPEN_TIMEOUT, OWNER_STOP_TIMEOUT, SDK_DLOPEN_FLAGS,
+    SdkFailure, SwpDefaults, LINK_LOST_STATUS, OPEN_TIMEOUT, OWNER_STOP_TIMEOUT,
     register_sdk_session, release_sdk_mode,
 };
 
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlerror() -> *const c_char;
-}
+use crate::sdk_library::{self, dlclose, dlsym};
 
 type Open = unsafe extern "C" fn(*mut *mut c_void, *const RtaRequest, *mut RtaActual) -> c_int;
 type Reconfig = unsafe extern "C" fn(*mut c_void, *const RtaRequest, *mut RtaActual) -> c_int;
@@ -340,14 +334,7 @@ unsafe impl Send for Device {}
 impl Device {
     fn open(path: &str, params: &RtaParams) -> Result<Self, String> {
         owner_slot_free()?;
-        let path = CString::new(path).map_err(|_| "invalid SDK shim path")?;
-        let library = unsafe { dlopen(path.as_ptr(), SDK_DLOPEN_FLAGS) };
-        if library.is_null() {
-            return Err(format!(
-                "SDK shim: {}",
-                unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy()
-            ));
-        }
+        let library = sdk_library::open(&path).map_err(|error| format!("load SDK shim: {error}"))?;
         let result = (|| {
             unsafe { register_sdk_session(library)?; }
             let symbol = |name: &'static [u8]| -> Result<*mut c_void, String> {

@@ -11,6 +11,10 @@ use std::{
 const MAX_SPOOL: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_TIMELINE: u64 = 64 * 1024 * 1024;
 
+pub(super) fn unavailable_reason() -> &'static str {
+    "Opus requires FFmpeg with the libopus encoder on the server"
+}
+
 pub(crate) fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -190,9 +194,7 @@ fn pad(n: u64) -> u64 {
 }
 fn prepare(path: &FsPath, task: &Value, cancel: &AtomicBool) -> io::Result<(u64, Plan)> {
     if !available() {
-        return Err(io_error(
-            "Opus requires FFmpeg with the libopus encoder on the server",
-        ));
+        return Err(io_error(unavailable_reason()));
     }
     let spool = Spool::new()?;
     let mut timeline = File::create(spool.path.join("frames.jsonl"))?;

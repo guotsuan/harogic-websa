@@ -3,3 +3,6 @@ dsp/core/fdk/NOTICE whitespace=-blank-at-eof
 frontend/public/fonts/LICENSE.txt whitespace=-blank-at-eol
 LICENSES/BSD-3-Clause-GNSS-SDR.txt whitespace=-blank-at-eof
 tools/companions/dtmb/*.patch whitespace=-blank-at-eol,-space-before-tab
+
+# Check out the Windows launcher with its native line endings.
+*.bat text eol=crlf

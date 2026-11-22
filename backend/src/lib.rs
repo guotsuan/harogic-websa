@@ -15,6 +15,10 @@ pub mod nr;
 mod nr_neural;
 mod nr_resample;
 pub mod catalog;
+#[cfg(not(windows))]
+pub mod external;
+#[cfg(windows)]
+#[path = "external/windows.rs"]
 pub mod external;
 mod wire;
 /// Shared Rust/browser wire budgets, generated from contracts/stream-limits.json.

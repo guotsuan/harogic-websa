@@ -1,4 +1,5 @@
 //! SoapySDRServer owns the device exclusively until its child has been reaped.
+pub(super) use super::server_bind::parse_bind;
 use serde_json::{json, Value};
 use std::{collections::VecDeque, io::{self, Read}, net::IpAddr,
     os::{fd::AsRawFd, unix::process::{CommandExt, ExitStatusExt}}, path::{Path, PathBuf},
@@ -377,19 +378,6 @@ fn supervise_child(
     let _ = lifetime.recv();
 }
 
-pub(super) fn parse_bind(data:&Value,current:IpAddr,current_port:u16)->Result<(IpAddr,u16),String> {
-    let address=match data.get("bind_address") {
-        None=>current,
-        Some(value)=>value.as_str().ok_or("bind_address must be an IP literal")?
-            .parse::<IpAddr>().map_err(|_|"bind_address must be an IP literal".to_string())?,
-    };
-    let port=match data.get("port") {
-        None=>current_port,
-        Some(value)=>value.as_u64().filter(|p|(1..=65535).contains(p))
-            .ok_or("port must be an integer from 1 to 65535")? as u16,
-    };
-    Ok((address,port))
-}
 fn trusted_binary(key:&str,default:&str)->std::ffi::OsString {std::env::var_os(key).unwrap_or_else(||default.into())}
 fn module_path()->Option<PathBuf> {
     std::env::var_os("WEBSA_SOAPY_MODULE_PATH").map(PathBuf::from).or_else(||

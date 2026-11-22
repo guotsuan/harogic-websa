@@ -63,6 +63,7 @@ fn hierarchy(leaf:&Path,mount:&Path)->Vec<PathBuf> {
     }
     result
 }
+#[cfg(target_os="linux")]
 fn cpu_seconds()->Option<f64> {
     let stat=std::fs::read_to_string("/proc/self/stat").ok()?;
     let fields:Vec<_>=stat.rsplit_once(") ")?.1.split_whitespace().collect();
@@ -70,6 +71,8 @@ fn cpu_seconds()->Option<f64> {
     let ticks=unsafe {sysconf(2)};if ticks<=0 {return None;}
     Some((fields.get(11)?.parse::<u64>().ok()?+fields.get(12)?.parse::<u64>().ok()?) as f64/ticks as f64)
 }
+#[cfg(not(target_os="linux"))]
+fn cpu_seconds()->Option<f64> {None}
 fn kibibytes(text:&str,name:&str)->Option<u64> {
     text.lines().find_map(|line|line.strip_prefix(name))?.split_whitespace().next()?.parse::<u64>().ok().map(|value|value*1024)
 }

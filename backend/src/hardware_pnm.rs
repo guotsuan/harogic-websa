@@ -3,7 +3,7 @@
 //! the vendor cycle machine (start/partial updates/done) lives there and retains
 //! the physical session between Rust mode owners.
 use std::{
-    ffi::{c_char, c_int, c_void, CStr, CString},
+    ffi::{c_int, c_void},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
@@ -19,13 +19,9 @@ use crate::hardware_swp::{
     call_owner, finish_owner, owner_slot_free, park_stuck_owner, GnssInfo, OWNER_STOP_TIMEOUT,
 };
 
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlerror() -> *const c_char;
-}
+use crate::sdk_library::{self, dlclose, dlsym};
+#[cfg(all(test, unix))]
+use {crate::sdk_library::dlopen, std::ffi::CString};
 
 type Open = unsafe extern "C" fn(
     *mut *mut c_void,
@@ -112,14 +108,7 @@ fn geometry_ok(points: u32, segments: u32, partial: u32) -> bool {
 impl Device {
     fn open(path: &str, params: &PnmParams) -> Result<Self, String> {
         owner_slot_free()?;
-        let path = CString::new(path).map_err(|_| "invalid SDK shim path")?;
-        let library = unsafe { dlopen(path.as_ptr(), crate::hardware_swp::SDK_DLOPEN_FLAGS) };
-        if library.is_null() {
-            return Err(format!(
-                "SDK shim: {}",
-                unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy()
-            ));
-        }
+        let library = sdk_library::open(&path).map_err(|error| format!("load SDK shim: {error}"))?;
         let result = (|| {
             unsafe { crate::hardware_swp::register_sdk_session(library)?; }
             let symbol = |name: &'static [u8]| -> Result<*mut c_void, String> {

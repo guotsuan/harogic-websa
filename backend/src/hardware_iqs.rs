@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 
 use std::{
     collections::VecDeque,
-    ffi::{c_char, c_int, c_void, CStr, CString},
+    ffi::{c_int, c_void},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -20,6 +20,11 @@ use std::{
 };
 
 const N: usize = 16240;
+pub(crate) const MAX_PACKET_SAMPLES: usize = 16242;
+
+fn supported_packet_samples(samples: u32) -> bool {
+    matches!(samples as usize, N | MAX_PACKET_SAMPLES)
+}
 const FS: f64 = 62_500_000.0;
 /// Bounded SDK-owner handoff. The depth absorbs host scheduling tails without
 /// dropping packets or creating an unbounded buffer; it is a latency/memory
@@ -37,9 +42,9 @@ struct SpectrumSchedule {
 impl SpectrumSchedule {
     fn due(&self) -> bool { self.ticks >= self.next }
 
-    fn received(&mut self, device_decimate: c_int) {
+    fn received(&mut self, device_decimate: c_int, samples: usize) {
         if self.due() { self.next += (FS / 20.0) as u64; }
-        self.ticks += N as u64 * device_decimate as u64;
+        self.ticks += samples as u64 * device_decimate as u64;
     }
 }
 
@@ -70,13 +75,9 @@ fn packet_error(operation: &str, status: i32, samples: u32) -> String {
     }
 }
 
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlerror() -> *const c_char;
-}
+use crate::sdk_library::{self, dlclose, dlsym};
+#[cfg(all(test, unix))]
+use {crate::sdk_library::dlopen, std::ffi::CString};
 
 type OpenV8 = unsafe extern "C" fn(
     *mut *mut c_void,
@@ -390,8 +391,8 @@ fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
-fn packet_period_ns(device_decimate: c_int) -> u64 {
-    N as u64 * device_decimate as u64 * 1_000_000_000 / FS as u64
+fn packet_period_ns(device_decimate: c_int, samples: usize) -> u64 {
+    samples as u64 * device_decimate as u64 * 1_000_000_000 / FS as u64
 }
 
 #[derive(Clone, Default)]
@@ -607,14 +608,7 @@ impl Device {
         device_decimate: c_int,
     ) -> Result<(Self, CaptureGeometry), String> {
         owner_slot_free()?;
-        let path = CString::new(path).map_err(|_| "invalid SDK shim path")?;
-        let library = unsafe { dlopen(path.as_ptr(), crate::hardware_swp::SDK_DLOPEN_FLAGS) };
-        if library.is_null() {
-            return Err(format!(
-                "SDK shim: {}",
-                unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy()
-            ));
-        }
+        let library = sdk_library::open(&path).map_err(|error| format!("load SDK shim: {error}"))?;
         let result = (|| {
             unsafe { crate::hardware_swp::register_sdk_session(library)?; }
             let symbol = |name: &'static [u8]| -> Result<*mut c_void, String> {
@@ -748,9 +742,9 @@ impl Device {
     }
 
     fn fetch_batch(&mut self, next: NextBatch, count: usize) -> Result<Packet, NextFailure> {
-        let mut buffers: Vec<_> = (0..count).map(|_|vec![0i16; N*2]).collect();
+        let mut buffers: Vec<_> = (0..count).map(|_|vec![0i16; MAX_PACKET_SAMPLES * 2]).collect();
         let mut slots: Vec<_> = buffers.iter_mut().map(|iq| BatchSlot {
-            iq: iq.as_mut_ptr(), capacity: N as u32, info: PacketInfo::default(),
+            iq: iq.as_mut_ptr(), capacity: MAX_PACKET_SAMPLES as u32, info: PacketInfo::default(),
             timing: SdkTiming::default(), warning: 0, status: 0,
         }).collect();
         let mut attempted = 0;
@@ -762,13 +756,14 @@ impl Device {
             return Err(NextFailure {status: (status != 0).then_some(status),
                 message: format!("SDK IQS malformed batch status={status} attempted={attempted}")});
         }
-        for (slot, iq) in slots.into_iter().zip(buffers).take(attempted as usize) {
-            let packet = if slot.status != 0 || slot.info.samples as usize != N {
+        for (slot, mut iq) in slots.into_iter().zip(buffers).take(attempted as usize) {
+            let packet = if slot.status != 0 || !supported_packet_samples(slot.info.samples) {
                 Err(NextFailure {status: (slot.status != 0).then_some(slot.status),
                     message: packet_error("batch",slot.status,slot.info.samples)})
             } else if !slot.info.scale_to_v.is_finite() {
                 Err(NextFailure {status:None,message:"SDK IQS nonfinite scale".into()})
             } else {
+                iq.truncate(slot.info.samples as usize * 2);
                 Ok(Packet {seq:0,stamp:slot.info.stamp,warning:slot.warning,scale_to_v:slot.info.scale_to_v,
                     iq,spectrum:None,generation:0})
             };
@@ -782,7 +777,7 @@ impl Device {
     }
 
     fn next_single(&mut self, with_spectrum: bool) -> Result<Packet, NextFailure> {
-        let mut iq = vec![0i16; N * 2];
+        let mut iq = vec![0i16; MAX_PACKET_SAMPLES * 2];
         let mut info = PacketInfo::default();
         let (mut freq, mut power) = if with_spectrum {
             (vec![0.0f64; N], vec![0.0f32; N])
@@ -796,7 +791,7 @@ impl Device {
             (self.next)(
                 self.handle,
                 iq.as_mut_ptr(),
-                N as u32,
+                MAX_PACKET_SAMPLES as u32,
                 &mut info,
                 if with_spectrum {
                     freq.as_mut_ptr()
@@ -814,7 +809,7 @@ impl Device {
                 &mut warning,
             )
         };
-        if status != 0 || info.samples as usize != N {
+        if status != 0 || !supported_packet_samples(info.samples) {
             if status == -8 || status == -9 {
                 self.abandoned = true;
             }
@@ -835,6 +830,7 @@ impl Device {
                 message: "SDK IQS FFT point count rejected".into(),
             });
         }
+        iq.truncate(info.samples as usize * 2);
         freq.truncate(points as usize);
         power.truncate(points as usize);
         if freq.iter().any(|hz| !hz.is_finite()) || power.iter().any(|dbm| !dbm.is_finite()) {
@@ -1043,6 +1039,7 @@ impl HardwareCapture {
                 // Complex samples in successfully enqueued packets; the failing
                 // packet's host input index is this value.
                 let mut enqueued_samples = 0u64;
+                let mut packet_samples = N;
                 let mut scheduling_generation = None;
                 let mut scheduling_retry = None;
                 // Configuration and consumer setup are complete. Start the vendor
@@ -1068,7 +1065,7 @@ impl HardwareCapture {
                             state.timings.control_serve.observe(served);
                             let event = CaptureEvent {
                                 attempt, packet_seq, generation,
-                                period_ns: packet_period_ns(settings.device_decimate),
+                                period_ns: packet_period_ns(settings.device_decimate, packet_samples),
                                 control_serve_ns: duration_ns(served),
                                 failed: result.is_err(),
                                 ..CaptureEvent::default()
@@ -1086,6 +1083,7 @@ impl HardwareCapture {
                             transient_streak = 0;
                             last_packet_at = Instant::now();
                             spectrum_schedule = SpectrumSchedule::default();
+                            packet_samples = N;
                         }
                         continue;
                     }
@@ -1097,7 +1095,7 @@ impl HardwareCapture {
                     // keep single-packet dispatch and original control latency.
                     let batch_limit = if !inline_spectrum && settings.device_decimate == 1 { 4 }
                     else if settings.device_decimate == 1 && !spectrum_due {
-                        ((spectrum_schedule.next - spectrum_schedule.ticks).div_ceil(N as u64) as usize).min(4)
+                        ((spectrum_schedule.next - spectrum_schedule.ticks).div_ceil(packet_samples as u64) as usize).min(4)
                     } else {1};
                     let result = device.next(with_spectrum, batch_limit);
                     // The SDK creates its USB pump lazily on the first read,
@@ -1121,7 +1119,7 @@ impl HardwareCapture {
                         status: result.as_ref().err().and_then(|failure| failure.status)
                             .or_else(|| result.as_ref().ok().map(|packet| packet.warning)),
                         failed: result.is_err(),
-                        period_ns: packet_period_ns(settings.device_decimate),
+                        period_ns: packet_period_ns(settings.device_decimate, packet_samples),
                         fetch_ns: duration_ns(fetched),
                         sdk_available: sdk_timing.is_some(),
                         sdk_measured: sdk.measured,
@@ -1197,7 +1195,8 @@ impl HardwareCapture {
                     };
                     let received_at = Instant::now();
                     packet_seq += 1;
-                    spectrum_schedule.received(settings.device_decimate);
+                    packet_samples = packet.iq.len() / 2;
+                    spectrum_schedule.received(settings.device_decimate, packet_samples);
                     let (first_stamp, first_host) =
                         first.get_or_insert((packet.stamp, received_at));
                     {
@@ -1225,7 +1224,7 @@ impl HardwareCapture {
                         packet.event.queue_wait_ns = duration_ns(packet.enqueued_at.duration_since(queue_started));
                         match packet_tx.try_send(packet) {
                             Ok(()) => {
-                                enqueued_samples = enqueued_samples.saturating_add(N as u64);
+                                enqueued_samples = enqueued_samples.saturating_add(packet_samples as u64);
                                 let queued = queue_started.elapsed();
                                 let mut state = owner_stats.lock();
                                 state.timings.queue_wait.observe(queued);
@@ -1648,13 +1647,13 @@ extern "C" int san90_test_gate(int release) {
             let mut frames = 0;
             for _ in 0..packets {
                 frames += usize::from(schedule.due());
-                schedule.received(decimate);
+                schedule.received(decimate, N);
             }
             assert_eq!(frames, 200, "decimate={decimate}");
             // A retune/rerate must expose a fresh spectrum on its first packet.
             schedule = SpectrumSchedule::default();
             assert!(schedule.due());
-            schedule.received(decimate);
+            schedule.received(decimate, N);
             assert!(!schedule.due());
         }
     }
@@ -1911,7 +1910,7 @@ extern "C" int san90_close(void* handle) {
             assert_eq!(packet.spectrum.is_some(),display);
             assert_eq!(packet.iq[251],251);
             displays+=usize::from(display);
-            schedule.received(1);
+            schedule.received(1, N);
         }
         assert_eq!(displays,3);
         while device.pending.is_empty() {device.next(false,4).unwrap_or_else(|e|panic!("{}",e.message));}
@@ -2154,41 +2153,51 @@ extern "C" int SWP_Configuration(void**, const SWP_Profile_TypeDef* in, SWP_Prof
     *out = *in; *trace = {}; return 0;
 }
 static int configuration_mode = 0;
+static uint32_t sdk_packet_samples = 16240;
 static int starts = 0, stops = 0;
 extern "C" int IQS_BusTriggerStart(void**) { ++starts; return 0; }
 extern "C" int IQS_BusTriggerStop(void**) { ++stops; return 0; }
 extern "C" int IQS_Configuration(void**, const IQS_Profile_TypeDef* in, IQS_Profile_TypeDef* out, IQS_StreamInfo_TypeDef* stream) {
     *out = *in;
     out->RefLevel_dBm = -17.5; out->Atten = 13; out->Preamplifier = ForcedOff; out->IFGainGrade = 2;
-    *stream = {}; stream->PacketSamples = 16240; stream->IQSampleRate = 3906250.0; stream->Bandwidth = 3125000.0;
-    stream->PacketDataSize = 16240 * 4;
+    const auto model = san90_session.boot_info.DeviceInfo.Model;
+    const bool fast = model == Device_N400_R2_V2 || model == Device_E90_R2 || model == Device_E200_R2;
+    assert(in->DecimateFactor == (fast ? 32u : 16u));
+    if (fast) assert(in->NativeIQSampleRate_SPS == 125000000.0);
+    *stream = {};
+    stream->PacketSamples = sdk_packet_samples;
+    stream->IQSampleRate = (fast ? 125000000.0 : 62500000.0) / in->DecimateFactor;
+    stream->Bandwidth = stream->IQSampleRate * 0.8;
+    stream->PacketDataSize = sdk_packet_samples * 4;
     if (configuration_mode == 1) stream->IQSampleRate = std::numeric_limits<double>::quiet_NaN();
     if (configuration_mode == 2) stream->IQSampleRate = std::numeric_limits<double>::infinity();
     if (configuration_mode == 3) stream->PacketDataSize -= 1;
     if (configuration_mode == 4) stream->PacketDataSize += 1;
     if (configuration_mode == 5) out->DataFormat = Complex8bit;
     if (configuration_mode == 6) stream->PacketSamples = UINT32_MAX;
+    if (configuration_mode == 7) out->CenterFreq_Hz = 9e9;
     return 0;
 }
 static int packet_mode = -12;
 static int fft_mode = -12;
 static bool overflow_flag = false;
 static uint64_t next_stamp = 0;
-static int16_t samples[16240 * 2];
+static int16_t samples[16242 * 2];
 extern "C" int IQS_GetIQStream_PM1(void**, IQStream_TypeDef* stream) {
     *stream = {};
     stream->AlternIQStream = packet_mode == 2 ? nullptr : samples;
-    stream->IQS_StreamInfo.PacketSamples = packet_mode == 1 ? 1 : packet_mode == 8 ? UINT32_MAX : 16240;
-    stream->IQS_StreamInfo.PacketDataSize = packet_mode == 4 ? 16240 * 4 - 1 : packet_mode == 5 ? 16240 * 4 + 1 : 16240 * 4;
+    stream->IQS_StreamInfo.PacketSamples = packet_mode == 1 ? 1 : packet_mode == 8 ? UINT32_MAX : sdk_packet_samples;
+    stream->IQS_StreamInfo.PacketDataSize = packet_mode == 4 ? sdk_packet_samples * 4 - 1 : packet_mode == 5 ? sdk_packet_samples * 4 + 1 : sdk_packet_samples * 4;
     stream->IQS_Profile.DataFormat = packet_mode == 6 ? Complex8bit : packet_mode == 7 ? Real16bit : Complex16bit;
     stream->IQS_TriggerInfo.SysTimerCountOfFirstDataPoint = next_stamp;
-    next_stamp += 519680;
+    next_stamp += 32 * sdk_packet_samples;
     stream->IQS_ScaleToV = packet_mode == 3 ? std::numeric_limits<float>::quiet_NaN() : 1.0f;
     if (packet_mode == 9) stream->IQS_ScaleToV = std::numeric_limits<float>::infinity();
     stream->DeviceState.IFOverflow = overflow_flag;
     return packet_mode < 0 ? packet_mode : 0;
 }
 extern "C" int DSP_FFT_IQSToSpectrum(void**, const IQStream_TypeDef* stream, double* freq, float* power) {
+    assert(stream->IQS_StreamInfo.PacketSamples == 16240);
     assert(stream->IQS_StreamInfo.Bandwidth == 3125000.0);
     assert(stream->IQS_StreamInfo.IQSampleRate == 3906250.0);
     for (int i = 0; i < 8; ++i) {
@@ -2251,7 +2260,7 @@ int main() {
             : next();
         assert(status == 0);
         assert(info.stamp == i * 519680 && info.samples == 16240);
-        assert(std::memcmp(copied, samples, sizeof(samples)) == 0);
+        assert(std::memcmp(copied, samples, sizeof(copied)) == 0);
         assert(state.warning == -12);
         if (i % 3 == 2) {
             assert(warning == -12 && timing.fetch_status == -12 && timing.fft_status == -12);
@@ -2289,6 +2298,44 @@ int main() {
     assert(next() == 0 && warning == 0);
     packet_mode = -10;
     assert(next() == -10 && warning == 0 && timing.fetch_status == -10);
+    // A 16242-complex-sample payload is forwarded in full. The legacy inline
+    // FFT still uses its configured 16240-point window.
+    sdk_packet_samples = 16242;
+    san90_session.call(&state, [&] {
+        san90_session.boot_info.DeviceInfo.Model = Device_N400_R2_V2;
+        return 0;
+    });
+    packet_mode = fft_mode = 0;
+    double bandwidth = 0, center = 0;
+    San90FrontEnd profile{};
+    assert(san90_iqs_reconfig_v2(&state, 100000000.0, &profile, 16, &bandwidth, &center) == 0);
+    int16_t wider[16242 * 2]{};
+    samples[16242 * 2 - 1] = 111;
+    assert(next() == -100);
+    assert(san90_next_v3(&state, wider, 16242, &info, freq, power, 8, &points, &timing, &warning) == 0);
+    assert(info.samples == 16242 && wider[16242 * 2 - 1] == 111 && points == 8);
+    const auto first_stamp = info.stamp;
+    assert(san90_next(&state, wider, 16242, &info) == 0);
+    assert(info.stamp - first_stamp == 32 * 16242);
+    San90IqsBatchSlot slot{};
+    slot.iq = wider;
+    slot.capacity = 16242;
+    uint32_t attempted = 0;
+    assert(san90_next_batch_v1(&state, &slot, 1, &attempted) == 0);
+    assert(attempted == 1 && slot.info.samples == 16242 && wider[16242 * 2 - 1] == 111);
+    for (const auto model : {Device_E90_R2, Device_E200_R2}) {
+        san90_session.call(&state, [&] {
+            san90_session.boot_info.DeviceInfo.Model = model;
+            return 0;
+        });
+        const double requested_center = model == Device_E90_R2 ? 9.4e9 : 19.5e9;
+        assert(san90_iqs_reconfig_v2(&state, requested_center, &profile, 16, &bandwidth, &center) == 0);
+        assert(center == requested_center && state.sample_rate_hz == 3906250.0);
+        configuration_mode = 7;
+        assert(san90_iqs_reconfig_v2(&state, requested_center, &profile, 16, &bandwidth, &center) == -105);
+        assert(state.center_hz == requested_center);
+        configuration_mode = 0;
+    }
     san90_session.call(&state, [&] {
         san90_session.active = nullptr;
         san90_session.handle = nullptr;

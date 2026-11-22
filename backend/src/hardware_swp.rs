@@ -3,7 +3,7 @@
 //! retains the physical handle across mode owners and preserves vendor thread affinity.
 //! This module also holds the contracts shared by every hardware owner module.
 use std::{
-    ffi::{c_char, c_int, c_void, CStr, CString},
+    ffi::{c_int, c_void},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
@@ -15,17 +15,12 @@ use std::{
 
 use parking_lot::Mutex;
 
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-    fn dlerror() -> *const c_char;
-}
+use crate::sdk_library::{self, dlclose, dlsym};
+#[cfg(all(test, unix))]
+use {crate::sdk_library::dlopen, std::ffi::CString};
 
-/// Linux RTLD_NOW | RTLD_NODELETE: cached SDK state outlives every Rust mode owner,
-/// including failed opens. The vendor module must remain mapped until process exit.
-pub(crate) const SDK_DLOPEN_FLAGS: c_int = 2 | 0x1000;
+#[cfg(all(test, unix))]
+pub(crate) use crate::sdk_library::SDK_DLOPEN_FLAGS;
 type SessionFinish = unsafe extern "C" fn() -> c_int;
 type SessionRelease = unsafe extern "C" fn() -> c_int;
 type SessionInvalidate = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
@@ -750,14 +745,7 @@ fn geometry_of(actual: &SwpActual) -> Result<SwpGeometry, String> {
 impl Device {
     fn open(path: &str, params: &SwpParams) -> Result<Self, String> {
         owner_slot_free()?;
-        let path = CString::new(path).map_err(|_| "invalid SDK shim path")?;
-        let library = unsafe { dlopen(path.as_ptr(), SDK_DLOPEN_FLAGS) };
-        if library.is_null() {
-            return Err(format!(
-                "SDK shim: {}",
-                unsafe { CStr::from_ptr(dlerror()) }.to_string_lossy()
-            ));
-        }
+        let library = sdk_library::open(&path).map_err(|error| format!("load SDK shim: {error}"))?;
         let result = (|| {
             unsafe { register_sdk_session(library)?; }
             let symbol = |name: &'static [u8]| -> Result<*mut c_void, String> {

@@ -2,17 +2,14 @@
 use super::*;
 use std::time::Instant;
 use std::{
-    ffi::{c_char, c_int, c_void, CString},
+    ffi::c_void,
     sync::mpsc,
     thread,
 };
 
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
-}
+use crate::sdk_library::{self, dlclose, dlsym};
+#[cfg(all(test, unix))]
+use {crate::sdk_library::dlopen, std::ffi::{c_int, CString}};
 type Open = unsafe extern "C" fn(*mut *mut c_void, u32, *mut u32, *mut f64) -> i32;
 type Execute = unsafe extern "C" fn(
     *mut c_void,
@@ -46,11 +43,7 @@ impl Drop for Dsp {
 }
 impl Dsp {
     fn open(path: &str, size: usize) -> Result<Self, String> {
-        let path = CString::new(path).map_err(|_| "invalid display FFT shim path")?;
-        let library = unsafe { dlopen(path.as_ptr(), hardware_swp::SDK_DLOPEN_FLAGS) };
-        if library.is_null() {
-            return Err("display FFT shim unavailable".into());
-        }
+        let library = sdk_library::open(path).map_err(|error| format!("load display FFT shim: {error}"))?;
         let result = (|| {
             let sym = |name: &[u8]| {
                 let p = unsafe { dlsym(library, name.as_ptr().cast()) };

@@ -23,7 +23,11 @@ pub(super) mod audio_files;
 pub(super) mod flac;
 #[path = "recording_audio_read.rs"]
 pub(super) mod audio_read;
+#[cfg(not(windows))]
 #[path = "recording_opus.rs"]
+pub(super) mod opus;
+#[cfg(windows)]
+#[path = "recording_opus_windows.rs"]
 pub(super) mod opus;
 #[path = "recording_management.rs"]
 pub(super) mod management;
@@ -69,8 +73,8 @@ fn persist(path: &FsPath, task: &Value) -> io::Result<()> {
         file.write_all(&serde_json::to_vec(task)?)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&temporary, path.join("task.json"))?;
-        File::open(path)?.sync_all()
+        storage_publish::rename(&temporary, &path.join("task.json"))?;
+        storage_publish::sync_directory(path)
     })();
     if result.is_err() { let _ = fs::remove_file(&temporary); }
     result
@@ -368,7 +372,7 @@ impl Manager {
     pub(super) fn start_configured(&mut self, uid: &str, service: &str, request: &str, kind: &str, audio_format: &str, name: &str) -> Result<StartTicket, String> {
         if kind == "audio" {
             if !matches!(audio_format, "wav" | "flac" | "opus") { return Err("audio_format must be wav, flac or opus".into()); }
-            if audio_format == "opus" && !opus::available() { return Err("Opus requires FFmpeg with the libopus encoder on the server".into()); }
+            if audio_format == "opus" && !opus::available() { return Err(opus::unavailable_reason().into()); }
         }
         self.start_task(uid, service, request, kind, Some(audio_format), name)
     }
@@ -715,7 +719,7 @@ fn run(lane: Arc<Lane>, path: PathBuf) {
     let result = (|| {
         fs::create_dir(&path)?;
         let _ = lane.owned_path.set(path.clone());
-        File::open(path.parent().ok_or_else(|| io_error("recording directory has no parent"))?)?.sync_all()?;
+        storage_publish::sync_directory(path.parent().ok_or_else(|| io_error("recording directory has no parent"))?)?;
         match lane.kind.as_str() { "results" => results::work(&lane, &path), "audio" => audio::work(&lane, &path), _ => work(&lane, &path) }
     })();
     let mut task = lane.task.lock().unwrap().clone();
@@ -1012,7 +1016,7 @@ fn recover(path: &FsPath, task: &mut Value) -> io::Result<()> {
                 rebuilt.write_all(b"\n")
             });
             rebuilt.sync_all()?;
-            fs::rename(&temporary, file.with_extension("jsonl"))?;
+            storage_publish::rename(&temporary, &file.with_extension("jsonl"))?;
             // A corrupt suffix still commits the index of its verified prefix.
             Ok(scanned)
         })();

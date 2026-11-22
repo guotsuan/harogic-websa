@@ -74,14 +74,14 @@ fn perform(app: &Arc<App>, request: &Value, preview: bool) -> Result<(), String>
     // Release acquisition state before performing filesystem operations.
     drop(state);
     let operation = if deleting {
-        fs::rename(&path, &tombstone)
+        storage_publish::rename(&path, &tombstone)
     } else {
         persist(&path, &task)
     };
     // Commit the tombstone before reporting success; a power loss must not
     // resurrect a deleted recording during the next metadata-only startup.
     let durable = if deleting && operation.is_ok() {
-        File::open(path.parent().unwrap()).and_then(|directory| directory.sync_all())
+        storage_publish::sync_directory(path.parent().unwrap())
     } else { Ok(()) };
     state = app.state.lock().unwrap();
     operation.map_err(|e| e.to_string())?;

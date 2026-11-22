@@ -57,9 +57,9 @@ impl DevState {
     pub(super) fn fit_service_capture(&self,requested_center:f64,display:i64,taps:usize,
         configs:Vec<receiver_workers::ChannelConfig>,pan:bool)->Result<CaptureConfig,String> {
         let (minimum,maximum)=self.freq_limits();
-        // SWP readback can widen receiver coverage beyond the model's IQ tuner range.
+        // The IQ tuner retains its minimum center frequency. Its upper limit
+        // follows the detected RF range rather than the fallback SAN-90 cap.
         let center_minimum=minimum.max(self.caps()["fmin"].as_f64().unwrap_or(9e3));
-        let center_maximum=maximum.min(self.caps()["fmax"].as_f64().unwrap_or(9e9));
         let hardware=self.hardware_shim.is_some();
         // RF limits constrain the tuner center, not the edges of its IQ window.
         // A retained off-screen receiver can still require a wider device capture.
@@ -70,7 +70,7 @@ impl DevState {
             let bandwidth=fs*0.8;
             let half=bandwidth/2.0;
             if display_half_width(display as i32)>half {continue;}
-            let mut center=requested_center.clamp(center_minimum,center_maximum);
+            let mut center=requested_center.clamp(center_minimum,maximum);
             let mut next=configs.clone();
             if (pan || center!=requested_center) && next[0].enabled {
                 let Ok(source)=service_ddc::source_plan(fs,&next[0]) else {continue;};
@@ -91,7 +91,7 @@ impl DevState {
                     // passbands. Fit the center, preserving the user's listen frequency.
                     center=service_ddc::fit_passband_frequency(next[0].freq,center,
                         center_minimum.max(next[0].freq-listen_half),
-                        center_maximum.min(next[0].freq+listen_half),taps,plan)?;
+                        maximum.min(next[0].freq+listen_half),taps,plan)?;
                 }
             }
             // A pan can drag the primary out of a band-limited decoder's band. Demote
@@ -397,7 +397,7 @@ mod tests {
                 let config=state.parse_channel_config(&json!({"channel":1,"freq":frequency})).unwrap();
                 let capture=state.channel_recapture(&config).unwrap().unwrap();
                 assert_eq!(capture.configs[0].freq,frequency);
-                assert_eq!(capture.center,frequency.clamp(9_000.0,9_000_000_000.0));
+                assert_eq!(capture.center,frequency.clamp(9_000.0,maximum));
                 let plan=service_ddc::channel_plan(COARSE_RATE,&config).unwrap();
                 Ddc::validate_service_frequency(capture.center,capture.bandwidth,capture.source_rate,capture.taps,frequency,&plan).unwrap();
             }
@@ -405,9 +405,24 @@ mod tests {
     }
 
     #[test]
+    fn capture_above_nine_ghz_uses_identified_device_limits() {
+        for (model, upper, test_center) in [(10, 9.5e9, 9.4e9), (20, 20e9, 19.5e9)] {
+            let mut state = state_with_expanded_sweep_limits();
+            state.device_defaults = None;
+            state.device_detail = Some(json!({"model": model}));
+            assert_eq!(state.freq_limits().1, upper);
+            let requested = json!({"center": test_center, "listen": test_center});
+            let capture = state.parse_service_capture(&requested).unwrap();
+            assert_eq!(capture.center, test_center);
+            assert_eq!(capture.configs[0].freq, test_center);
+            assert!(state.parse_service_capture(&json!({"listen": upper + 1e6})).is_err());
+        }
+    }
+
+    #[test]
     fn capture_center_clamps_at_iq_limits_without_insetting_iq_edges() {
         let mut state=state_with_expanded_sweep_limits();
-        for (boundary,outside) in [(9_000.0,-1e6),(9_000_000_000.0,9_021_000_000.0)] {
+        for (boundary,outside) in [(9_000.0,-1e6),(9_020_000_000.0,9_021_000_000.0)] {
             state.sdr_center=boundary;
             state.sdr_listen=boundary;
             for requested in [boundary,outside] {
