@@ -2078,6 +2078,7 @@ dependencies = [
  "tokio-tungstenite",
  "tract-onnx",
  "websa-dsp",
+ "windows-sys",
  "zstd",
 ]
 

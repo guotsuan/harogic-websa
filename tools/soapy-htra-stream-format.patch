@@ -53,7 +53,7 @@
  {
      if (args.count("serial")) _serial = args.at("serial");
  
-@@ -170,57 +178,53 @@
+@@ -170,57 +178,54 @@
      if (!ipArg.empty()) _ip_address = ipArg;
  
      void* dev_tmp = nullptr;
@@ -94,7 +94,8 @@
 -                                         std::to_string(_device_number) +
 -                                         " does not match requested serial " + _serial);
 +            for (unsigned i = 0; i < count; ++i) {
-+                const std::string serial = uidToString(infos[i].DeviceUID);
++                const auto uid = infos[i].DeviceUID;
++                const std::string serial = uid ? uidToString(uid) : std::string{};
 +                if (_serial.empty() || _serial == serial) {
 +                    _serial = serial;
 +                    _dev_index = indexes[i];
@@ -151,7 +152,7 @@
          }
      } else {
          // If ETH is explicitly selected with only a serial number, try to resolve
-@@ -231,6 +235,8 @@
+@@ -231,6 +236,8 @@
              uint8_t localIP[4] = {};
              uint8_t localMask[4] = {};
              if (Device_GetNetworkDeviceList(&count, networkInfo, localIP, localMask) == 0) {
@@ -160,7 +161,7 @@
                  for (uint8_t i = 0; i < count; ++i) {
                      if (uidToString(networkInfo[i].DeviceUID) == _serial) {
                          _ip_address = ipv4ToString(networkInfo[i].IPAddress);
-@@ -240,9 +246,10 @@
+@@ -240,9 +247,10 @@
              }
          }
  
@@ -172,7 +173,7 @@
              throw std::runtime_error("Harogic ETH device at " + _ip_address +
                                       " could not be opened, status=" +
                                       std::to_string(status));
-@@ -252,8 +259,6 @@
+@@ -252,8 +260,6 @@
          _dev_info = binfo.DeviceInfo;
          const std::string serial = uidToString(binfo.DeviceInfo.DeviceUID);
          if (_serial.empty()) _serial = serial;
@@ -181,7 +182,7 @@
  
          if (!_serial.empty() && _serial != serial) {
              throw std::runtime_error("ETH device at " + _ip_address +
-@@ -270,16 +275,15 @@
+@@ -270,16 +276,15 @@
                    _physical_interface.c_str(),
                    deviceLocation.c_str());
  
@@ -207,7 +208,7 @@
      for (int i = 0; i < 8; i++) {
          _available_sample_rates.push_back(default_profile.NativeIQSampleRate_SPS / (double)(1 << i));
      }
-@@ -291,14 +295,17 @@
+@@ -291,14 +296,17 @@
      _rx_ports["SWR"] = SWR_Port;
      _rx_ports["INT"] = INT_Port;
      _antenna = "External";
@@ -230,7 +231,7 @@
  std::string SoapyHarogic::getHardwareKey() const { return "HTRA"; }
  SoapySDR::Kwargs SoapyHarogic::getHardwareInfo() const {
      SoapySDR::Kwargs info;
-@@ -314,69 +321,90 @@
+@@ -314,69 +322,90 @@
  size_t SoapyHarogic::getNumChannels(const int dir) const { return (dir == SOAPY_SDR_RX) ? 1 : 0; }
  
  std::vector<std::string> SoapyHarogic::getStreamFormats(const int, const size_t) const {
@@ -357,7 +358,7 @@
          if (_physical_interface == "USB") {
              SoapySDR_logf(SOAPY_SDR_INFO, "Opening stream via USB, device=%d", _device_number);
          } else {
-@@ -384,25 +412,15 @@
+@@ -384,25 +413,15 @@
                            _ip_address.c_str(), static_cast<unsigned>(HTRA_ETH_REMOTE_PORT));
          }
  
@@ -388,7 +389,7 @@
  
          _profile.CenterFreq_Hz = _center_freq;
          _profile.RefLevel_dBm = _ref_level;
-@@ -436,39 +454,82 @@
+@@ -436,39 +455,82 @@
          SoapySDR_logf(SOAPY_SDR_INFO, "  - Gain Strategy:    %s", gainStratStr.c_str());
          SoapySDR_log(SOAPY_SDR_INFO, "---------------------------------------------");
 
@@ -481,7 +482,7 @@
      }
      SoapySDR_log(SOAPY_SDR_INFO, "Stream deactivated");
      return 0;
-@@ -476,76 +537,78 @@
+@@ -476,76 +538,78 @@
  
  int SoapyHarogic::readStream(SoapySDR::Stream *, void *const *buffs, const size_t numElems, int &flags, long long &, const long timeoutUs) {
      std::unique_lock<std::mutex> lock(_buffer_mutex);
@@ -612,7 +613,7 @@
          lock.unlock();
          _buffer_cv.notify_one();
      }
-@@ -573,16 +636,24 @@
+@@ -573,16 +637,24 @@
      return infos;
  }
  void SoapyHarogic::writeSetting(const std::string &key, const std::string &value) {
@@ -645,7 +646,7 @@
      if (key == "gain_strategy") return (_gain_strategy == LowNoisePreferred) ? "Low Noise" : "High Linearity";
      if (key == "lo_mode") {
          if (_lo_mode == LOOpt_Speed) return "Speed";
-@@ -599,11 +670,18 @@
+@@ -599,11 +671,18 @@
      return antennas;
  }
  void SoapyHarogic::setAntenna(const int, const size_t, const std::string &name) {
@@ -667,7 +668,7 @@
  
  std::vector<std::string> SoapyHarogic::listGains(const int, const size_t) const { return {"REF", "PREAMP", "IF_AGC"}; }
  bool SoapyHarogic::hasGainMode(const int, const size_t) const { return false; }
-@@ -613,12 +691,31 @@
+@@ -613,12 +692,31 @@
  double SoapyHarogic::getGain(const int dir, const size_t chan) const { return this->getGain(dir, chan, "REF"); }
  SoapySDR::Range SoapyHarogic::getGainRange(const int dir, const size_t chan) const { return this->getGainRange(dir, chan, "REF"); }
  void SoapyHarogic::setGain(const int, const size_t, const std::string &name, const double value) {
@@ -703,7 +704,7 @@
      if (name == "REF") return _ref_level;
      if (name == "PREAMP") return (_preamp_mode == AutoOn) ? 1.0 : 0.0;
      if (name == "IF_AGC") return _if_agc ? 1.0 : 0.0;
-@@ -630,53 +727,42 @@
+@@ -630,53 +728,42 @@
      return SoapySDR::Range(0.0, 0.0);
  }
  
@@ -788,7 +789,7 @@
  }
  
  static SoapySDR::KwargsList findHarogic(const SoapySDR::Kwargs &args) {
-@@ -697,83 +783,70 @@
+@@ -697,83 +784,73 @@
  
      if (searchUSB) {
          BootProfile_TypeDef profile = makeBootProfile("USB", "192.168.1.100", false);
@@ -816,11 +817,16 @@
 +        if (status == 0) {
 +            for (unsigned i = 0; i < count; ++i) {
 +                if (requestedDevice >= 0 && indexes[i] != requestedDevice) continue;
-+                const std::string serial = uidToString(infos[i].DeviceUID);
++                // The Windows SDK can leave the UID unset until Device_Open.
++                const auto uid = infos[i].DeviceUID;
++                const std::string serial = uid ? uidToString(uid) : std::string{};
 +                if (!serialFilter.empty() && serialFilter != serial) continue;
                  SoapySDR::Kwargs dev_info;
-                 dev_info["serial"] = serial;
-                 dev_info["label"] = "Harogic USB " + serial;
+-                dev_info["serial"] = serial;
+-                dev_info["label"] = "Harogic USB " + serial;
++                if (!serial.empty()) dev_info["serial"] = serial;
++                dev_info["label"] = "Harogic USB " +
++                    (serial.empty() ? std::to_string(indexes[i]) : serial);
 -                dev_info["driver"] = "Harogic";
 +                dev_info["driver"] = "harogic";
                  dev_info["interface"] = "USB";

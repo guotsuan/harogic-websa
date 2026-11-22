@@ -1,0 +1,26 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,3 +36,8 @@
+ message(STATUS "Configuration successful! Target 'HarogicSupport' will be built.")
+ message(STATUS "Final install path will be: ${SoapySDR_MODULE_INSTALL_DIR}")
+ message(STATUS "GNU Radio usage: Core -> Soapy -> Source -> Soapy Custom Source")
++
++if(WIN32)
++    target_link_libraries(HarogicSupport PRIVATE ws2_32)
++endif()
++target_compile_features(HarogicSupport PRIVATE cxx_std_17)
+--- a/HarogicDevice.cpp
++++ b/HarogicDevice.cpp
+@@ -20,7 +20,12 @@
+
+ #include "HarogicDevice.hpp"
+
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
+ #include <arpa/inet.h>
++#endif
+ #include <cctype>
+ #include <cstdio>
+ #include <cmath>

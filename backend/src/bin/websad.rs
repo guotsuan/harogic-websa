@@ -87,11 +87,7 @@ use service_routes::api_config;
 mod sixteen_channel_tests;
 #[path = "websad/server_bind.rs"]
 mod server_bind;
-#[cfg(not(windows))]
 #[path = "websad/server_mode.rs"]
-mod server_mode;
-#[cfg(windows)]
-#[path = "websad/server_mode_windows.rs"]
 mod server_mode;
 #[path = "websad/receiver_limits.rs"]
 mod receiver_limits;

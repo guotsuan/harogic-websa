@@ -2,17 +2,31 @@
 pub(super) use super::server_bind::parse_bind;
 use serde_json::{json, Value};
 use std::{collections::VecDeque, io::{self, Read}, net::IpAddr,
-    os::{fd::AsRawFd, unix::process::{CommandExt, ExitStatusExt}}, path::{Path, PathBuf},
+    path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+#[cfg(not(windows))]
+use std::{
+    os::{fd::AsRawFd as PipeHandle, unix::process::{CommandExt, ExitStatusExt}},
     sync::mpsc::{self, Receiver, Sender},
-    thread::{self, JoinHandle}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+    thread::{self, JoinHandle},
+};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle as PipeHandle, OwnedHandle};
+#[cfg(windows)]
+#[path = "server_process_windows.rs"]
+mod windows;
 
 const LOG_LINES: usize = 200;
 const LOG_BYTES: usize = 64 * 1024;
 const CHUNK_BYTES: usize = 2048;
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(not(windows))]
 const STOP_GRACE: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
+#[cfg(not(windows))]
 unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn getpid() -> i32;
@@ -31,13 +45,16 @@ impl Run {
 }
 
 struct Output<R> { reader: R, pending: Vec<u8> }
-impl<R: Read + AsRawFd> Output<R> {
+impl<R: Read + PipeHandle> Output<R> {
     fn new(reader: R) -> io::Result<Self> {
         // Linux F_GETFL/F_SETFL/O_NONBLOCK. No reader thread can outlive the child
         // or hold stop hostage when a descendant retains the write end.
-        let flags = unsafe { fcntl(reader.as_raw_fd(), 3) };
-        if flags < 0 || unsafe { fcntl(reader.as_raw_fd(), 4, flags | 0x800) } < 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(not(windows))]
+        {
+            let flags = unsafe { fcntl(reader.as_raw_fd(), 3) };
+            if flags < 0 || unsafe { fcntl(reader.as_raw_fd(), 4, flags | 0x800) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(Self { reader, pending: Vec::with_capacity(CHUNK_BYTES) })
     }
@@ -47,7 +64,11 @@ impl<R: Read + AsRawFd> Output<R> {
         let mut buffer = [0u8; CHUNK_BYTES];
         // A continuously writing child must not monopolize the state lock.
         for _ in 0..32 {
-            match self.reader.read(&mut buffer) {
+            #[cfg(windows)]
+            let read = windows::read_pipe(&mut self.reader, &mut buffer);
+            #[cfg(not(windows))]
+            let read = self.reader.read(&mut buffer);
+            match read {
                 Ok(0) => { self.flush(&mut lines); break; }
                 Ok(length) => for byte in &buffer[..length] {
                     if *byte == b'\n' { self.flush(&mut lines); }
@@ -92,8 +113,12 @@ struct Owned {
     ready: bool,
     // Dropped only after this child is reaped. The spawning thread blocks on
     // the other end, so parent death is armed for exactly this child's life.
+    #[cfg(not(windows))]
     lifetime: Sender<()>,
+    #[cfg(not(windows))]
     supervisor: Option<JoinHandle<()>>,
+    #[cfg(windows)]
+    _job: OwnedHandle,
 }
 
 pub(super) struct SoapyServer {
@@ -187,25 +212,29 @@ impl SoapyServer {
     }
 
     fn start_command(&mut self, command: Command) -> Result<(),String> {
-        let (ready_tx,ready_rx)=mpsc::sync_channel(0);
-        let (lifetime_tx,lifetime_rx)=mpsc::channel();
-        let supervisor=match thread::Builder::new().name("soapy-server".into()).spawn(move || {
-            supervise_child(command, ready_tx, lifetime_rx);
-        }) {Ok(thread)=>thread,Err(error)=>return self.fail(format!("failed to start SoapySDRServer supervisor: {error}"))};
-        let spawned=match ready_rx.recv() {
-            Ok(spawned)=>spawned,
-            Err(_)=>{
-                drop(lifetime_tx);
-                let _=supervisor.join();
-                return self.fail("SoapySDRServer supervisor exited before spawn".into());
-            }
+        #[cfg(windows)]
+        let (mut process, stdout, stderr, job) = match windows::spawn(command) {
+            Ok(child) => child,
+            Err(error) => return self.fail(format!("failed to start SoapySDRServer: {error}")),
         };
-        let (mut process,stdout,stderr)=match spawned {
-            Ok(spawned)=>spawned,
-            Err(error)=>{
-                drop(lifetime_tx);
-                let _=supervisor.join();
-                return self.fail(error);
+        #[cfg(not(windows))]
+        let (mut process, stdout, stderr, lifetime_tx, supervisor) = {
+            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+            let (lifetime_tx, lifetime_rx) = mpsc::channel();
+            let supervisor = match thread::Builder::new().name("soapy-server".into()).spawn(move || {
+                supervise_child(command, ready_tx, lifetime_rx);
+            }) {
+                Ok(thread) => thread,
+                Err(error) => return self.fail(format!("failed to start SoapySDRServer supervisor: {error}")),
+            };
+            match ready_rx.recv() {
+                Ok(Ok((process, stdout, stderr))) => (process, stdout, stderr, lifetime_tx, supervisor),
+                result => {
+                    drop(lifetime_tx);
+                    let _ = supervisor.join();
+                    return self.fail(result.ok().and_then(Result::err)
+                        .unwrap_or_else(|| "SoapySDRServer supervisor exited before spawn".into()));
+                }
             }
         };
         let stdout=Output::new(stdout);
@@ -214,14 +243,23 @@ impl SoapyServer {
             (Ok(out),Ok(err))=>(out,err),
             (out,err)=>{
                 let _=process.kill(); let _=process.wait();
-                drop(lifetime_tx);
-                let _=supervisor.join();
+                #[cfg(not(windows))]
+                {
+                    drop(lifetime_tx);
+                    let _=supervisor.join();
+                }
                 return self.fail(format!("failed to capture SoapySDRServer output: {}",out.err().or_else(||err.err()).unwrap()));
             }
         };
         let pid=process.id();
         self.child=Some(Owned {process,stdout,stderr,started:Instant::now(),ready:false,
-            lifetime:lifetime_tx,supervisor:Some(supervisor)});
+            #[cfg(not(windows))]
+            lifetime:lifetime_tx,
+            #[cfg(not(windows))]
+            supervisor:Some(supervisor),
+            #[cfg(windows)]
+            _job:job,
+        });
         self.state=Run::Starting; self.error=None; self.exit_code=None;
         self.log("lifecycle",format!("starting SoapySDRServer pid {pid} on {}",self.endpoint()));
         // The owned child's exact readiness line is authoritative; never connect
@@ -263,13 +301,22 @@ impl SoapyServer {
         self.state=Run::Stopping;
         let pid=self.child.as_ref().unwrap().process.id();
         self.log("lifecycle",format!("stopping SoapySDRServer pid {pid}"));
+        #[cfg(not(windows))]
         unsafe {kill(pid as i32,15);}
+        #[cfg(windows)]
+        if let Some(child) = self.child.as_mut() {
+            // The packaged Windows server treats EOF as a graceful stop request.
+            drop(child.process.stdin.take());
+        }
         if self.wait_for_exit(STOP_GRACE)? {return Ok(true);}
+        #[cfg(not(windows))]
         self.log("lifecycle","SoapySDRServer did not stop during grace period; sending SIGKILL".into());
+        #[cfg(windows)]
+        self.log("lifecycle","SoapySDRServer did not stop during grace period; terminating process".into());
         if let Some(child)=self.child.as_mut() {let _=child.process.kill();}
         if self.wait_for_exit(Duration::from_secs(1))? {return Ok(true);}
         // Keep ownership and reject acquisition until a later poll reaps it.
-        let reason="SoapySDRServer did not exit after SIGKILL; device remains reserved".to_string();
+        let reason="SoapySDRServer did not exit after forced termination; device remains reserved".to_string();
         self.state=Run::Failed; self.error=Some(reason.clone()); self.log("lifecycle",reason.clone());
         Err(reason)
     }
@@ -300,11 +347,19 @@ impl SoapyServer {
 
     fn finish_child(&mut self, status: std::process::ExitStatus) {
         self.drain();
-        self.exit_code=status.code().or_else(||status.signal().map(|s|128+s));
-        if let Some(mut child)=self.child.take() {
-            // Unblock the spawn thread only after wait has reaped this child.
-            drop(child.lifetime);
-            if let Some(supervisor)=child.supervisor.take() {let _=supervisor.join();}
+        self.exit_code = status.code();
+        #[cfg(windows)]
+        drop(self.child.take());
+        #[cfg(not(windows))]
+        {
+            self.exit_code = self.exit_code.or_else(|| status.signal().map(|signal| 128 + signal));
+            if let Some(mut child) = self.child.take() {
+                // Unblock the spawn thread only after wait has reaped this child.
+                drop(child.lifetime);
+                if let Some(supervisor) = child.supervisor.take() {
+                    let _ = supervisor.join();
+                }
+            }
         }
     }
 
@@ -344,6 +399,7 @@ impl SoapyServer {
 }
 impl Drop for SoapyServer {fn drop(&mut self){let _=self.stop();}}
 
+#[cfg(not(windows))]
 fn supervise_child(
     mut command: Command,
     ready: mpsc::SyncSender<Result<(Child, ChildStdout, ChildStderr), String>>,
@@ -378,12 +434,22 @@ fn supervise_child(
     let _ = lifetime.recv();
 }
 
-fn trusted_binary(key:&str,default:&str)->std::ffi::OsString {std::env::var_os(key).unwrap_or_else(||default.into())}
+fn trusted_binary(key:&str,default:&str)->std::ffi::OsString {
+    #[cfg(windows)]
+    return std::env::var_os(key).unwrap_or_else(|| windows::binary(default).into_os_string());
+    #[cfg(not(windows))]
+    std::env::var_os(key).unwrap_or_else(|| default.into())
+}
 fn module_path()->Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("WEBSA_SOAPY_MODULE_PATH").map(PathBuf::from);
+    #[cfg(not(windows))]
     std::env::var_os("WEBSA_SOAPY_MODULE_PATH").map(PathBuf::from).or_else(||
         std::env::var_os("HOME").map(|h|PathBuf::from(h).join(".local/share/harogic-websa/soapy/lib/SoapySDR/modules0.8")))
 }
 fn module_environment(command:&mut Command) {
+    #[cfg(windows)]
+    windows::configure_command(command);
     let mut paths=Vec::new();if let Some(path)=module_path(){paths.push(path);}
     if let Some(inherited)=std::env::var_os("SOAPY_SDR_PLUGIN_PATH"){paths.extend(std::env::split_paths(&inherited));}
     if let Ok(paths)=std::env::join_paths(paths){command.env("SOAPY_SDR_PLUGIN_PATH",paths);}
@@ -445,6 +511,7 @@ fn info_has_harogic(text:&str)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use std::net::TcpListener;
 
     #[test]
@@ -471,6 +538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn oversized_non_newline_output_and_foreign_pipe_writer_are_bounded() {
         use std::os::unix::net::UnixStream;
         use std::io::Write;
@@ -488,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn log_chunks_preserve_a_utf8_character_split_across_reads() {
         use std::os::unix::net::UnixStream;
         use std::io::Write;
@@ -503,6 +572,7 @@ mod tests {
         assert_eq!(output.drain(), vec!["€"]);
     }
 
+    #[cfg(not(windows))]
     fn owned_python(program:&str,port:u16)->SoapyServer {
         let mut command=Command::new("python3");
         command.args(["-u","-c",program,&port.to_string()])
@@ -513,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn supervised_manager_subprocess_fixture() {
         let Some(pid_file)=std::env::var_os("WEBSA_TEST_SOAPY_PARENT_PID_FILE") else {return};
         // The command worker retires immediately after returning the manager.
@@ -546,6 +617,7 @@ mod tests {
         loop {thread::park();}
     }
 
+    #[cfg(not(windows))]
     fn parent_fixture(pid_file:&Path, normal_stop:bool)->Child {
         let mut command=Command::new(std::env::current_exe().unwrap());
         command.args(["--exact","server_mode::tests::supervised_manager_subprocess_fixture","--test-threads=1"])
@@ -556,6 +628,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn killing_manager_parent_kills_its_owned_server() {
         let directory=std::env::temp_dir().join(format!("websa_soapy_parent_death_{}",std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -591,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn normal_manager_stop_joins_its_spawn_thread() {
         let directory=std::env::temp_dir().join(format!("websa_soapy_normal_stop_{}",std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -598,12 +672,14 @@ mod tests {
         assert!(parent.wait().unwrap().success());
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[cfg(not(windows))]
     fn settle(server:&mut SoapyServer) {
         let deadline=Instant::now()+Duration::from_secs(3);
         while server.state==Run::Starting && Instant::now()<deadline {server.poll();std::thread::sleep(Duration::from_millis(10));}
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn foreign_listener_does_not_make_owned_child_ready_and_bind_failure_is_kept() {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
         let mut server=owned_python("import socket,sys\ns=socket.socket()\ntry: s.bind(('127.0.0.1',int(sys.argv[1])))\nexcept OSError as e: print('Server socket bind FAIL: '+str(e),file=sys.stderr)",port);
@@ -615,6 +691,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn silent_child_times_out_and_is_reaped_without_claiming_a_listener() {
         let mut server=owned_python("import time;time.sleep(60)",55132);
         server.child.as_mut().unwrap().started=Instant::now()-READY_TIMEOUT;
@@ -626,6 +703,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn listening_stop_reaps_and_later_child_failure_retains_reason() {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();drop(listener);
         let mut server=owned_python("import socket,sys,time\ns=socket.socket();s.bind(('127.0.0.1',int(sys.argv[1])));s.listen();print('Server bound to 127.0.0.1:'+sys.argv[1]);time.sleep(60)",port);

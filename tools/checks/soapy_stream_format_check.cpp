@@ -51,6 +51,7 @@ bool g_fail_configuration = false;
 bool g_fail_open = false;
 int g_last_device_index = -1;
 int g_device_lists = 0;
+bool g_usb_discovery_uid_unavailable = false;
 uint8_t g_network_count = 0;
 int g_network_lists = 0;
 std::array<uint8_t, 4> g_last_ip{};
@@ -99,10 +100,10 @@ int Device_List(const BootProfile_TypeDef *, uint8_t *count, uint8_t indices[MAX
     if (!count || !indices || !info) return -1;
     ++g_device_lists;
     *count = 2;
-    indices[0] = 2;
+    indices[0] = g_usb_discovery_uid_unavailable ? 0 : 2;
     indices[1] = 7;
     std::memset(info, 0, 2 * sizeof(*info));
-    info[0].DeviceUID = 0xA11CE;
+    if (!g_usb_discovery_uid_unavailable) info[0].DeviceUID = 0xA11CE;
     info[1].DeviceUID = 0xB0B;
     info[0].Model = info[1].Model = 90;
     info[0].HardwareVersion = info[1].HardwareVersion = 1;
@@ -278,6 +279,35 @@ static void check_discovery() {
            "USB enumeration ignored conflicting filters");
     expect(g_device_lists > 0 && g_opens == 0 && g_closes == 0,
            "USB enumeration opened hardware instead of using Device_List");
+}
+
+static void check_usb_discovery_without_uid() {
+    g_usb_discovery_uid_unavailable = true;
+    const SoapySDR::Kwargs usb{{"driver", "harogic"}, {"interface", "usb"}};
+    const auto devices = SoapySDR::Device::enumerate(usb);
+    expect(devices.size() == 2 && devices[0].at("device") == "0" &&
+           !devices[0].count("serial") && devices[1].at("serial") == "B0B",
+           "USB discovery published a zero UID as a serial or lost a known UID");
+
+    for (const auto &args : {usb, devices.front()}) {
+        std::unique_ptr<SoapySDR::Device, void (*)(SoapySDR::Device*)>
+            device(SoapySDR::Device::make(args), &SoapySDR::Device::unmake);
+        expect(device && g_last_device_index == 0 &&
+               device->getHardwareInfo().at("serial") == "A11CE",
+               "Soapy could not open the enumerated slot or recover its actual UID");
+    }
+
+    {
+        SoapyHarogic direct(SoapySDR::Kwargs{{"interface", "USB"}});
+        expect(g_last_device_index == 0 && direct.getHardwareInfo().at("serial") == "A11CE",
+               "USB constructor treated the unavailable discovery UID as a serial");
+    }
+
+    bool rejected = false;
+    try { SoapyHarogic wrong(SoapySDR::Kwargs{{"device", "0"}, {"serial", "B0B"}}); }
+    catch (const std::runtime_error &) { rejected = true; }
+    expect(rejected, "USB open ignored an explicit serial mismatch");
+    g_usb_discovery_uid_unavailable = false;
 }
 
 static void check_network_bounds(bool construction) {
@@ -491,6 +521,7 @@ int main(int argc, char **argv) {
     if (argc == 2) {
         const std::string selected = argv[1];
         if (selected == "gain-bounds") check_gain_bounds();
+        else if (selected == "usb-discovery-without-uid") check_usb_discovery_without_uid();
         else if (selected == "network-discovery-bounds") check_network_bounds(false);
         else if (selected == "network-constructor-bounds") check_network_bounds(true);
         else fail("unknown focused contract " + selected);
@@ -774,6 +805,7 @@ int main(int argc, char **argv) {
     check_sdk_bounds();
     expect(g_opens == g_closes, "SDK boundary checks leaked device handles");
     check_gain_bounds();
+    check_usb_discovery_without_uid();
     check_network_bounds(false);
     check_network_bounds(true);
     expect(g_opens == g_closes, "control/discovery boundary checks leaked device handles");

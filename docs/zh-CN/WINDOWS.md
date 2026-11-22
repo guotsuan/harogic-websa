@@ -16,6 +16,8 @@ WebSA 的适配器当前使用 HTRA USB 接口。如果厂商 SDK 只通过以�
 
 ## 启动
 
+使用预编译包时，解压后将 [HAROGIC Windows SDK](https://www.harogic.com/windows-sdk/) 的 `SA_Windows_API\x64\htra_api` 目录中的 DLL 复制到应用的 `htra_api`，并将仪器专用校准文件放入 `htra_api\CalFile`。应用包内已有 WebSA 的适配 DLL 和 Soapy 组件。更新时先退出旧版 WebSA 和手动启动的 SoapySDRServer，再启动新版。
+
 在 Windows 应用目录双击 `Start-WebSA.bat` 启动实机模式。确保 HAROGIC 驱动已安装，SAStudio4 等占用仪器的程序已关闭，应用的 `htra_api` 下有厂商 SDK 运行库和这台仪器对应的 `CalFile`。从源码构建时，可先在仓库根目录运行下面的命令，把 SDK 运行库和校准目录复制到本地构建产物中。
 
 ```powershell
@@ -40,4 +42,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -Fake
 
 先运行厂商示例确认驱动能识别仪器。关闭厂商程序后启动 WebSA，依次检查扫频、实时频谱和低速 IQ。切换模式和停止后确认设备可以重新打开，再从低速逐步提高 IQ 采样率，观察连续采集、丢包和溢出。Windows 走厂商 SDK 自带的 USB 采集路径，62.5 MS/s 的持续吞吐需要实机验证。
 
-Windows 首版的 SoapySDRServer 接管、外部解码器和 Opus 编码在界面及 API 中报告不可用。内置解调与外部解码器是独立的。FLAC 和 Opus 录音的 PCM 试听需要 PATH 中有 FFmpeg。三种依赖 ONNX Runtime 的神经降噪模式需要兼容 1.23.2 的 x64 `onnxruntime.dll`，可将其放在 `websad.exe` 同目录，或用 `WEBSA_ORT_DYLIB` 指向 DLL。
+Windows 上的外部解码器和 Opus 编码在界面及 API 中报告不可用。内置解调与外部解码器是独立的。FLAC 和 Opus 录音的 PCM 试听需要 PATH 中有 FFmpeg。三种依赖 ONNX Runtime 的神经降噪模式需要兼容 1.23.2 的 x64 `onnxruntime.dll`，可将其放在 `websad.exe` 同目录，或用 `WEBSA_ORT_DYLIB` 指向 DLL。
+
+## Soapy SRV
+
+新版使用 `soapy\bin\SoapySDRServer.exe` 和 `soapy\bin\SoapySDRUtil.exe`，并从同套运行库加载 HAROGIC 插件。选择 SRV 后，WebSA 停止本地采集并释放仪器。点击启动运行服务，切回频谱时 WebSA 会等待服务子进程退出，再重新打开仪器。
+
+先确认 STD 有实时频谱，然后进入 **SRV**。用 Mac 连接时，将绑定地址设为仪器可达的 Wi-Fi IPv4 地址，端口用 `55132`。点击启动后，从 Mac 连接 `driver=remote,remote=<仪器IP>:55132,remote:driver=harogic`。Windows 防火墙的放行范围可限定为仪器所在专用子网。采到 IQ 后点 **频谱** 返回 STD，确认频谱重新刷新。PXN-400 Z 的实测起点为约 976.6 kS/s、TCP、256 KiB 流缓冲。约 1.95 MS/s 的初次 Wi-Fi 测试曾出现溢出。
+
+Windows Soapy 配套组件使用 SoapySDR 0.8.1 和 SoapyRemote 0.5.2。重建时对 SoapyRemote 应用 [Windows 补丁](../../tools/soapy-remote-windows.patch)。HAROGIC 插件使用 [上游固定修订](https://github.com/HAROGIC-Technologies/soapy-htra/tree/762dbfa1512c705e1d8b86e820b06e8a10e08a92)，在 `soapy-htra` 源码目录依次应用 [流格式补丁](../../tools/soapy-htra-stream-format.patch) 和 [Windows 补丁](../../tools/soapy-htra-windows.patch)。CMake 的 `LibHTRA_INCLUDE_DIRS` 指向 Windows x64 SDK 头文件目录，`LibHTRA_LIBRARIES` 指向同目录的 `htra_api.lib`。将 Soapy 可执行文件和运行库放在 `soapy\bin`，插件放在 `soapy\lib\SoapySDR\modules0.8`。

@@ -101,7 +101,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -SdkDi
 
 Open [http://127.0.0.1:8080/](http://127.0.0.1:8080/) on the instrument. Test swept spectrum (STD) before switching to SDR. For later runs, stop the current instance with Ctrl+C and double-click `Start-WebSA.bat` in the application directory. The BAT listens on `0.0.0.0:8080` for access from a trusted LAN. To build and run with simulated data, omit `-SdkDirectory` from the build and run `.\run-windows.ps1 -Fake` from the checkout.
 
-Windows swept spectrum and SDR were confirmed on an N400 R2V2. The 9.4 GHz and 19.5 GHz SDR tuning and readback tests used a simulated SDK. Hardware validation on the three PX Z models is pending. See the [Windows guide (Chinese)](docs/zh-CN/WINDOWS.md) for calibration, troubleshooting and Windows feature availability.
+Windows swept spectrum and SDR were confirmed on an N400 R2V2. On a PXN-400 Z, the Windows Soapy SRV release streamed IQ to a Mac over Wi-Fi at about 976.6 kS/s. The SRV panel starts and stops SoapySDRServer and hands the analyzer back to WebSA when returning to Spectrum. The 9.4 GHz and 19.5 GHz SDR tuning and readback tests used a simulated SDK. See the [Windows guide (Chinese)](docs/zh-CN/WINDOWS.md) for deployment, calibration and SRV testing.
+
+For a prebuilt Windows release, extract the application ZIP and copy the separately supplied Windows x64 HTRA SDK runtime DLLs and the unit's calibration files into its `htra_api` directory. The release includes the WebSA SDK shim and the managed Soapy executables and driver.
+
+### Find WebSA on your LAN
+
+Copy [find-websa.py](tools/find-websa.py) to a computer on the same LAN as the analyzer. The script requires Python 3.8 or later and uses the standard library. Run it from the directory containing the script.
+
+```bash
+# Linux / macOS
+python3 find-websa.py
+```
+
+```powershell
+# Windows
+py -3 find-websa.py
+```
+
+Open a URL marked `WebSA:` in your browser. The script retries once after a brief delay if the host or network is unreachable.
+
+If you know the analyzer's address, add `--host 192.168.0.236` to check only that address and see the reason if the check fails. To display only the machine's own IPv4 addresses, add `--ips`. If you have several network interfaces, add `--subnet 192.168.0.0/24` to select a directly connected subnet. Add `--port` followed by the actual port if your server uses a port other than `8080`.
 
 ## Build and test
 

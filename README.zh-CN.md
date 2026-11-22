@@ -94,7 +94,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1 -SdkDi
 
 在仪器上打开 [http://127.0.0.1:8080/](http://127.0.0.1:8080/)，先试标准扫频（STD），再切换到 SDR。以后按 Ctrl+C 停止旧实例后，可双击应用目录里的 `Start-WebSA.bat` 启动。BAT 监听 `0.0.0.0:8080`，供可信局域网访问。只试模拟模式时，构建可省略 `-SdkDirectory`，然后在仓库根目录运行 `.\run-windows.ps1 -Fake`。
 
-Windows 扫频和 SDR 已在一台 N400 R2V2 上跑通。9.4 GHz 和 19.5 GHz 的 SDR 调谐与回读使用模拟 SDK 验证，三款 PX Z 仍待实机验收。更多校准、排障和功能说明见 [Windows 运行指南](docs/zh-CN/WINDOWS.md)。
+Windows 扫频和 SDR 已在一台 N400 R2V2 上跑通。PXN-400 Z 已通过 Wi-Fi 向 Mac 传输约 976.6 kS/s 的 Soapy IQ。切到 SRV 后可从网页启停 SoapySDRServer，返回频谱时由 WebSA 重新接管仪器。9.4 GHz 和 19.5 GHz 的 SDR 调谐与回读使用模拟 SDK 验证。部署、校准及 SRV 测试步骤见 [Windows 运行指南](docs/zh-CN/WINDOWS.md)。
+
+使用预编译 Windows 发布包时，将另行取得的 Windows x64 HTRA SDK 运行库与仪器校准文件复制到应用的 `htra_api` 目录。发布包已包含 WebSA 的 SDK 适配 DLL、受管 Soapy 服务和驱动。
+
+### 在局域网查找 WebSA
+
+把 [find-websa.py](tools/find-websa.py) 复制到与频谱仪连在同一局域网的电脑上。脚本使用 Python 3.8 或更新版本，无需安装 Python 扩展。在脚本所在目录运行：
+
+```bash
+# Linux / macOS
+python3 find-websa.py
+```
+
+```powershell
+# Windows
+py -3 find-websa.py
+```
+
+脚本列出本机 IPv4 地址，并确认同网段哪些主机在 `8080` 端口响应 WebSA。用浏览器打开输出中以 `WebSA:` 开头的 URL。遇到 `No route to host` 等路由不可达错误时，脚本会短暂等待后重试一次。
+
+已知仪器 IP 时，给命令加 `--host 192.168.0.236` 即可单独检查这个地址。检查失败时会显示具体连接错误，或提示收到的响应无法识别为 WebSA。只想查看本机地址时加 `--ips`。有多个网卡时，可以加 `--subnet 192.168.0.0/24` 指定当前连接的网段。服务改了端口时，加 `--port` 和实际端口号。
 
 ## 构建与测试
 

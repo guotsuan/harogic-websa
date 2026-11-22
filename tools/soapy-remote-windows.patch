@@ -1,0 +1,319 @@
+--- a/client/DiscoverServers.cpp
++++ b/client/DiscoverServers.cpp
+@@ -23,9 +23,9 @@
+     //On non-windows platforms the endpoint instance can last the
+     //duration of the process because it can be cleaned up safely.
+     //Windows has issues cleaning up threads and sockets on exit.
+-    #ifndef _MSC_VER
++    #ifndef _WIN32
+     static
+-    #endif //_MSC_VER
++    #endif //_WIN32
+     std::unique_ptr<SoapySSDPEndpoint> ssdpEndpoint(new SoapySSDPEndpoint());
+
+     //get all IPv4 and IPv6 URLs because we will fallback
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -50,7 +50,7 @@
+
+ #network libraries
+ if (WIN32)
+-    list(APPEND SoapySDR_LIBRARIES ws2_32)
++    list(APPEND SoapySDR_LIBRARIES ws2_32 iphlpapi)
+ endif (WIN32)
+
+ #avahi for discovery over mDNS/DNS-SD daemon
+--- a/common/SoapyInfoUtils.in.cpp
++++ b/common/SoapyInfoUtils.in.cpp
+@@ -6,7 +6,7 @@
+ #include <cstdlib> //rand
+ #include <chrono>
+
+-#ifdef _MSC_VER
++#ifdef _WIN32
+
+ #define getpid() GetCurrentProcessId()
+
+@@ -14,7 +14,7 @@
+ {
+     char szVolName[MAX_PATH];
+     char szFileSysName[80];
+-    DWORD dwSerialNumber;
++    DWORD dwSerialNumber = 0;
+     DWORD dwMaxComponentLen;
+     DWORD dwFileSysFlags;
+     GetVolumeInformation(
+@@ -24,7 +24,7 @@
+     return dwSerialNumber;
+ }
+
+-#endif //_MSC_VER
++#endif //_WIN32
+
+ std::string SoapyInfo::getHostName(void)
+ {
+--- a/common/SoapyRPCSocket.cpp
++++ b/common/SoapyRPCSocket.cpp
+@@ -10,6 +10,12 @@
+ #include <algorithm> //max
+ #include <mutex>
+
++#ifdef _WIN32
++static int selectLimit(SOCKET) { return 0; } // Winsock ignores nfds.
++#else
++static int selectLimit(int socket) { return socket + 1; }
++#endif
++
+ static std::mutex sessionMutex;
+ static size_t sessionCount = 0;
+
+@@ -19,7 +25,7 @@
+     sessionCount++;
+     if (sessionCount > 1) return;
+
+-    #ifdef _MSC_VER
++    #ifdef _WIN32
+     WORD wVersionRequested;
+     WSADATA wsaData;
+     wVersionRequested = MAKEWORD(2, 2);
+@@ -37,7 +43,7 @@
+     sessionCount--;
+     if (sessionCount > 0) return;
+
+-    #ifdef _MSC_VER
++    #ifdef _WIN32
+     WSACleanup();
+     #endif
+ }
+@@ -116,7 +122,7 @@
+     return ret;
+ }
+
+-int SoapyRPCSocket::bind(const std::string &url)
++int SoapyRPCSocket::bind(const std::string &url, const bool exclusive)
+ {
+     SoapyURL urlObj(url);
+     SockAddrData addr;
+@@ -134,14 +140,24 @@
+         return -1;
+     }
+
+-    //setup reuse address
+     int one = 1;
+-    int ret = ::setsockopt(_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+-    if (ret != 0)
+-    {
+-        this->reportError("setsockopt(SO_REUSEADDR)");
+-    }
+-
++#ifdef _WIN32
++    // A Windows listener must never share a port with an unrelated server.
++    if (exclusive && ::setsockopt(_sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
++        (const char *)&one, sizeof(one)) != 0)
++    {
++        this->reportError("setsockopt(SO_EXCLUSIVEADDRUSE)");
++        return -1;
++    }
++    if (!exclusive)
++#else
++    (void)exclusive;
++#endif
++    {
++        if (::setsockopt(_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one)) != 0)
++            this->reportError("setsockopt(SO_REUSEADDR)");
++    }
++    int ret;
+     #ifdef __APPLE__
+     ret = ::setsockopt(_sock, SOL_SOCKET, SO_REUSEPORT, (const char *)&one, sizeof(one));
+     if (ret != 0)
+@@ -168,7 +184,7 @@
+ {
+     struct sockaddr_storage addr;
+     socklen_t addrlen = sizeof(addr);
+-    int client = ::accept(_sock, (struct sockaddr*)&addr, &addrlen);
++    auto client = ::accept(_sock, (struct sockaddr*)&addr, &addrlen);
+     if (client == INVALID_SOCKET) return NULL;
+     SoapyRPCSocket *clientSock = new SoapyRPCSocket();
+     clientSock->_sock = client;
+@@ -241,7 +257,7 @@
+     FD_SET(_sock, &fds);
+
+     //wait for connect or timeout
+-    ret = ::select(_sock+1, NULL, &fds, NULL, &tv);
++    ret = ::select(selectLimit(_sock), NULL, &fds, NULL, &tv);
+     if (ret != 1)
+     {
+         this->reportError("connect("+url+")", SOCKET_ETIMEDOUT);
+@@ -268,7 +284,7 @@
+ int SoapyRPCSocket::setNonBlocking(const bool nonblock)
+ {
+     int ret = 0;
+-    #ifdef _MSC_VER
++    #ifdef _WIN32
+     u_long mode = nonblock?1:0;  // 1 to enable non-blocking socket
+     ret = ioctlsocket(_sock, FIONBIO, &mode);
+     #else
+@@ -472,7 +488,7 @@
+     FD_ZERO(&readfds);
+     FD_SET(_sock, &readfds);
+
+-    int ret = ::select(_sock+1, &readfds, NULL, NULL, &tv);
++    int ret = ::select(selectLimit(_sock), &readfds, NULL, NULL, &tv);
+     if (ret == -1) this->reportError("select()");
+     return ret == 1;
+ }
+@@ -486,14 +502,14 @@
+     fd_set readfds;
+     FD_ZERO(&readfds);
+
+-    int maxSock(socks.front()->_sock);
++    auto maxSock = socks.front()->_sock;
+     for (const auto &sock : socks)
+     {
+         maxSock = std::max(sock->_sock, maxSock);
+         FD_SET(sock->_sock, &readfds);
+     }
+
+-    int ret = ::select(maxSock+1, &readfds, NULL, NULL, &tv);
++    int ret = ::select(selectLimit(maxSock), &readfds, NULL, NULL, &tv);
+     if (ret == -1) return ret;
+
+     int count = 0;
+@@ -507,9 +523,9 @@
+
+ static std::string errToString(const int err)
+ {
+-    char buff[1024];
+-    #ifdef _MSC_VER
+-    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&buff, sizeof(buff), NULL);
++    char buff[1024] = {};
++    #ifdef _WIN32
++    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buff, sizeof(buff), NULL);
+     return buff;
+     #else
+     //http://linux.die.net/man/3/strerror_r
+--- a/common/SoapyRPCSocket.hpp
++++ b/common/SoapyRPCSocket.hpp
+@@ -3,6 +3,9 @@
+
+ #pragma once
+ #include "SoapyRemoteConfig.hpp"
++#ifdef _WIN32
++#include <winsock2.h>
++#endif
+ #include <cstddef>
+ #include <string>
+ #include <vector>
+@@ -63,7 +66,7 @@
+      * 0.0.0.0:1234
+      * [::]:1234
+      */
+-    int bind(const std::string &url);
++    int bind(const std::string &url, bool exclusive = false);
+
+     /*!
+      * Server listen.
+@@ -173,7 +176,11 @@
+     int getBuffSize(const bool isRecv);
+
+ private:
++#ifdef _WIN32
++    SOCKET _sock;
++#else
+     int _sock;
++#endif
+     std::string _lastErrorMsg;
+
+     void reportError(const std::string &what, const std::string &errorMsg);
+--- a/common/SoapySocketDefs.in.hpp
++++ b/common/SoapySocketDefs.in.hpp
+@@ -30,7 +30,9 @@
+ #cmakedefine HAS_UNISTD_H
+ #ifdef HAS_UNISTD_H
+ #include <unistd.h> //close
++#ifndef _WIN32
+ #define closesocket close
++#endif
+ #endif //HAS_UNISTD_H
+
+ #cmakedefine HAS_NETDB_H
+@@ -107,7 +109,7 @@
+ /***********************************************************************
+  * socket errno
+  **********************************************************************/
+-#ifdef _MSC_VER
++#ifdef _WIN32
+ #define SOCKET_ERRNO WSAGetLastError()
+ #define SOCKET_EINPROGRESS WSAEWOULDBLOCK
+ #define SOCKET_ETIMEDOUT WSAETIMEDOUT
+--- a/server/SoapyServer.cpp
++++ b/server/SoapyServer.cpp
+@@ -13,6 +13,9 @@
+ #include <iostream>
+ #include <getopt.h>
+ #include <csignal>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+
+ /***********************************************************************
+  * Print help message
+@@ -40,8 +43,33 @@
+ /***********************************************************************
+  * Launch the server
+  **********************************************************************/
++#ifdef _WIN32
++static bool websaStopRequested(HANDLE controlPipe)
++{
++    if (controlPipe == nullptr) return false;
++    return !PeekNamedPipe(controlPipe, nullptr, 0, nullptr, nullptr, nullptr);
++}
++#endif
++
+ static int runServer(void)
+ {
++#ifdef _WIN32
++    HANDLE controlPipe = nullptr;
++    if (std::getenv("WEBSA_SOAPY_MANAGED") != nullptr)
++    {
++        controlPipe = GetStdHandle(STD_INPUT_HANDLE);
++        if (GetFileType(controlPipe) != FILE_TYPE_PIPE)
++        {
++            std::cerr << "WebSA control pipe is unavailable" << std::endl;
++            return EXIT_FAILURE;
++        }
++        // Wait for WebSA to attach this process to its job before binding.
++        unsigned char start = 0;
++        DWORD count = 0;
++        if (!ReadFile(controlPipe, &start, sizeof(start), &count, nullptr) ||
++            count != sizeof(start) || start != 1) return EXIT_SUCCESS;
++    }
++#endif
+     SoapySocketSession sess;
+     const bool isIPv6Supported = not SoapyRPCSocket(SoapyURL("tcp", "::", "0").toString()).null();
+     const auto defaultBindNode = isIPv6Supported?"::":"0.0.0.0";
+@@ -62,13 +90,12 @@
+
+     std::cout << "Launching the server... " << url.toString() << std::endl;
+     SoapyRPCSocket s;
+-    if (s.bind(url.toString()) != 0)
++    if (s.bind(url.toString(), true) != 0 || s.listen(SOAPY_REMOTE_LISTEN_BACKLOG) != 0)
+     {
+         std::cerr << "Server socket bind FAIL: " << s.lastErrorMsg() << std::endl;
+         return EXIT_FAILURE;
+     }
+     std::cout << "Server bound to " << s.getsockname() << std::endl;
+-    s.listen(SOAPY_REMOTE_LISTEN_BACKLOG);
+     auto serverListener = new SoapyServerListener(s, serverUUID);
+
+     std::cout << "Launching discovery server... " << std::endl;
+@@ -85,6 +112,9 @@
+     bool exitFailure = false;
+     while (not serverDone and not exitFailure)
+     {
++#ifdef _WIN32
++        if (websaStopRequested(controlPipe)) break;
++#endif
+         serverListener->handleOnce();
+         if (not s.status())
+         {
